@@ -14,6 +14,7 @@ from starlette.concurrency import run_in_threadpool
 from model_functions import (
     DEFAULT_PROTOCOL_PROMPT,
     DEFAULT_SUMMARY_PROMPT,
+    RECOMMENDED_SUMMARY_MODELS,
     get_model_settings,
     HF_TOKEN_FILE,
     summarize_text_with_prompt_optimized,
@@ -35,6 +36,46 @@ BROWSER_CAPTURE_LOCK = threading.Lock()
 BROWSER_CAPTURE_TRANSCRIBE_LOCK = threading.Lock()
 BROWSER_CAPTURE_MODE_TRANSCRIPTION = "transcription"
 BROWSER_CAPTURE_MODE_DIARIZATION = "diarization"
+SUMMARY_MODEL_CUSTOM_CHOICE = "Своя модель / ручной HF id"
+
+
+def _summary_model_choice_label(model):
+    return f"{model['vram']} - {model['name']} ({model['model_id']})"
+
+
+SUMMARY_MODEL_CHOICE_TO_ID = {
+    _summary_model_choice_label(model): model["model_id"]
+    for model in RECOMMENDED_SUMMARY_MODELS
+}
+
+
+def _initial_summary_model_choice(model_id):
+    model_id = (model_id or "").strip()
+    for choice, recommended_model_id in SUMMARY_MODEL_CHOICE_TO_ID.items():
+        if recommended_model_id == model_id:
+            return choice
+    return SUMMARY_MODEL_CUSTOM_CHOICE
+
+
+def select_recommended_summary_model(choice, current_model_id):
+    return SUMMARY_MODEL_CHOICE_TO_ID.get(choice) or current_model_id
+
+
+def _recommended_summary_models_markdown():
+    rows = [
+        "| Память | Модель | HF id | Когда выбирать |",
+        "| --- | --- | --- | --- |",
+    ]
+    for model in RECOMMENDED_SUMMARY_MODELS:
+        rows.append(
+            f"| {model['vram']} | {model['name']} | `{model['model_id']}` | {model['note']} |"
+        )
+    return (
+        "#### Рекомендации по LLM для саммари и протокола\n\n"
+        "Оценка дана с запасом для загрузки через `transformers` без 4-bit квантования. "
+        "Фактическое потребление зависит от длины контекста, драйверов и того, загружен ли параллельно Whisper.\n\n"
+        + "\n".join(rows)
+    )
 
 
 def _mask_token(token):
@@ -107,7 +148,7 @@ def _model_settings_markdown(settings=None):
         f"режим `{settings['whisper_device']}` -> `{settings['whisper_resolved_device']}`; "
         f"compute `{settings['whisper_resolved_compute_type']}`; "
         f"batch `{settings['whisper_batch_size']}`.\n"
-        f"- Gemma/summary: `{settings['summary_model_name']}`; "
+        f"- LLM summary/protocol: `{settings['summary_model_name']}`; "
         f"размер чанка `{settings['summary_max_chunk_size']}` токенов.\n"
         f"- CUDA: {cuda_status}."
     )
@@ -807,7 +848,17 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
                     info="Количество worker-потоков faster-whisper.",
                 )
             with gr.Column():
-                gr.Markdown("### Gemma / суммаризация")
+                gr.Markdown("### LLM / суммаризация и протокол")
+                gr.Markdown(_recommended_summary_models_markdown())
+                summary_model_recommendation = gr.Dropdown(
+                    label="Рекомендованная модель по памяти",
+                    choices=[SUMMARY_MODEL_CUSTOM_CHOICE]
+                    + list(SUMMARY_MODEL_CHOICE_TO_ID.keys()),
+                    value=_initial_summary_model_choice(
+                        INITIAL_MODEL_SETTINGS["summary_model_name"]
+                    ),
+                    info="Выберите вариант, чтобы подставить HF id в поле ниже. Затем сохраните настройки.",
+                )
                 summary_model_input = gr.Textbox(
                     label="HF id модели для саммари и протокола",
                     value=INITIAL_MODEL_SETTINGS["summary_model_name"],
@@ -822,7 +873,8 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
                 )
                 gr.Markdown(
                     "Подсказка: на RTX 4090 для Whisper обычно выбирайте `auto`/`float16`. "
-                    "Если параллельно загружена Gemma и не хватает VRAM, временно переключите Whisper на `cpu`."
+                    "Если параллельно загружена LLM и не хватает VRAM, временно переключите Whisper на `cpu` "
+                    "или выберите LLM поменьше."
                 )
         save_model_settings_btn = gr.Button("Сохранить настройки моделей", variant="primary")
         model_settings_save_status = gr.Markdown("")
@@ -982,6 +1034,12 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
         fn=clear_hf_token,
         inputs=[],
         outputs=[hf_token_state, hf_token_input, hf_token_status],
+    )
+
+    summary_model_recommendation.change(
+        fn=select_recommended_summary_model,
+        inputs=[summary_model_recommendation, summary_model_input],
+        outputs=summary_model_input,
     )
 
     save_model_settings_btn.click(
