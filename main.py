@@ -1,0 +1,1046 @@
+import os
+import uuid
+import hashlib
+import threading
+import time
+from pathlib import Path
+
+import gradio as gr
+import uvicorn
+from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
+
+from model_functions import (
+    DEFAULT_PROTOCOL_PROMPT,
+    DEFAULT_SUMMARY_PROMPT,
+    HF_TOKEN_FILE,
+    SUMMARY_MAX_CHUNK_SIZE,
+    SUMMARY_MODEL_NAME,
+    summarize_text_with_prompt_optimized,
+    transcribe_audio,
+    transcribe_audio_live,
+)
+
+UPLOAD_DIR = Path("uploads")
+OUTPUT_DIR = Path("output_files")
+BROWSER_CAPTURE_DIR = Path("browser_capture_chunks")
+UPLOAD_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+BROWSER_CAPTURE_DIR.mkdir(exist_ok=True)
+BROWSER_CAPTURE_SEGMENT_MS = int(os.getenv("BROWSER_CAPTURE_SEGMENT_MS", "60000"))
+
+BROWSER_CAPTURE_SESSIONS = {}
+BROWSER_CAPTURE_LOCK = threading.Lock()
+BROWSER_CAPTURE_TRANSCRIBE_LOCK = threading.Lock()
+BROWSER_CAPTURE_MODE_TRANSCRIPTION = "transcription"
+BROWSER_CAPTURE_MODE_DIARIZATION = "diarization"
+
+
+def _mask_token(token):
+    token = (token or "").strip()
+    if not token:
+        return "Токен не задан."
+    if len(token) <= 8:
+        return "Токен сохранен."
+    return f"Токен сохранен: ...{token[-4:]}"
+
+
+def _load_saved_hf_token():
+    token = (os.getenv("HF_TOKEN") or "").strip()
+    if not token:
+        try:
+            token = HF_TOKEN_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            token = ""
+    if token:
+        os.environ["HF_TOKEN"] = token
+    return token
+
+
+def _store_hf_token(token):
+    HF_TOKEN_FILE.parent.mkdir(exist_ok=True, parents=True)
+    HF_TOKEN_FILE.write_text(token, encoding="utf-8")
+    try:
+        HF_TOKEN_FILE.chmod(0o600)
+    except OSError:
+        pass
+
+
+def save_hf_token(token):
+    token = (token or "").strip()
+    if not token:
+        return [
+            "",
+            gr.update(value=""),
+            "Токен не сохранен: поле пустое.",
+        ]
+
+    os.environ["HF_TOKEN"] = token
+    _store_hf_token(token)
+    return [
+        token,
+        gr.update(value=""),
+        f"{_mask_token(token)} Он сохранен локально в {HF_TOKEN_FILE}.",
+    ]
+
+
+def clear_hf_token():
+    os.environ.pop("HF_TOKEN", None)
+    try:
+        HF_TOKEN_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    return [
+        "",
+        gr.update(value=""),
+        "Токен очищен из текущего процесса и локального файла.",
+    ]
+
+
+def create_file_with_uuid(text, directory=OUTPUT_DIR):
+    directory = Path(directory)
+    directory.mkdir(exist_ok=True, parents=True)
+
+    file_path = directory / f"{uuid.uuid4()}.txt"
+    file_path.write_text(text, encoding="utf-8")
+    return str(file_path.resolve())
+
+
+def _browser_session_snapshot(session_id):
+    with BROWSER_CAPTURE_LOCK:
+        session = BROWSER_CAPTURE_SESSIONS.get(session_id)
+        if not session:
+            return {
+                "session_id": session_id,
+                "status": "Сессия захвата не найдена.",
+                "transcript": "",
+                "chunks": 0,
+                "running": False,
+            }
+        return {
+            "session_id": session_id,
+            "status": session["status"],
+            "transcript": session["transcript"],
+            "chunks": session["chunks"],
+            "running": session["running"],
+            "mode": session.get("mode", BROWSER_CAPTURE_MODE_TRANSCRIPTION),
+        }
+
+
+def _append_browser_transcript(session_id, text, status):
+    with BROWSER_CAPTURE_LOCK:
+        session = BROWSER_CAPTURE_SESSIONS.get(session_id)
+        if not session:
+            return
+        text = (text or "").strip()
+        chunk_number = session["chunks"] + 1
+        mode = session.get("mode", BROWSER_CAPTURE_MODE_TRANSCRIPTION)
+        if text and not text.startswith("Ошибка"):
+            if session["transcript"]:
+                session["transcript"] += "\n\n" if mode == BROWSER_CAPTURE_MODE_DIARIZATION else " "
+            if mode == BROWSER_CAPTURE_MODE_DIARIZATION:
+                session["transcript"] += f"[Сегмент {chunk_number}]\n{text}"
+            else:
+                session["transcript"] += text
+            session["status"] = status
+        elif text.startswith("Ошибка"):
+            session["errors"].append(text)
+            session["status"] = text
+        else:
+            session["status"] = (
+                "Сегмент обработан, речь не распознана. "
+                "Проверьте, что выбрана вкладка с видео и включена передача аудио."
+            )
+        session["chunks"] += 1
+        session["updated_at"] = time.time()
+
+
+def _normalize_browser_capture_mode(mode):
+    mode = (mode or BROWSER_CAPTURE_MODE_TRANSCRIPTION).strip()
+    if mode == BROWSER_CAPTURE_MODE_DIARIZATION:
+        return BROWSER_CAPTURE_MODE_DIARIZATION
+    return BROWSER_CAPTURE_MODE_TRANSCRIPTION
+
+
+def _transcribe_browser_capture_chunk(session_id, chunk_path):
+    with BROWSER_CAPTURE_LOCK:
+        session = BROWSER_CAPTURE_SESSIONS.get(session_id, {})
+        mode = session.get("mode", BROWSER_CAPTURE_MODE_TRANSCRIPTION)
+        min_speakers = session.get("min_speakers")
+        max_speakers = session.get("max_speakers")
+        diarization_model_path = session.get("diarization_model_path")
+
+    with BROWSER_CAPTURE_TRANSCRIBE_LOCK:
+        text = transcribe_audio(
+            audio_path=None,
+            video_path=str(chunk_path),
+            enable_diarization=mode == BROWSER_CAPTURE_MODE_DIARIZATION,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            diarization_model_path=diarization_model_path,
+        )
+    try:
+        Path(chunk_path).unlink(missing_ok=True)
+    except OSError:
+        pass
+    _append_browser_transcript(
+        session_id,
+        text,
+        f"Обработано сегментов: {_browser_session_snapshot(session_id)['chunks'] + 1}",
+    )
+    return _browser_session_snapshot(session_id)
+
+
+def load_browser_capture_text(session_id):
+    session_id = (session_id or "").strip()
+    if not session_id:
+        return [
+            gr.DownloadButton(visible=False),
+            "Сначала запустите захват звука вкладки браузера.",
+        ]
+    snapshot = _browser_session_snapshot(session_id)
+    text = snapshot["transcript"].strip()
+    if not text:
+        return [
+            gr.DownloadButton(visible=False),
+            snapshot["status"] or "Текст захвата пока пуст.",
+        ]
+    path = create_file_with_uuid(text)
+    return [
+        gr.DownloadButton(label="Скачать", value=path, visible=True),
+        text,
+    ]
+
+
+def _browser_capture_widget_html():
+    return """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #1f2937;
+      background: transparent;
+    }
+    .wrap {
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      padding: 12px;
+      background: #ffffff;
+    }
+    .title { margin: 0 0 8px; font-size: 16px; font-weight: 650; }
+    .hint { margin: 0 0 12px; font-size: 13px; line-height: 1.45; color: #4b5563; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+    .settings {
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) 110px 110px minmax(220px, 2fr);
+      gap: 8px;
+      margin-bottom: 10px;
+      align-items: end;
+    }
+    label { display: grid; gap: 4px; font-size: 12px; color: #4b5563; }
+    select, input {
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #ffffff;
+      color: #111827;
+      font: 14px/1.3 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    button {
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      padding: 8px 12px;
+      background: #f9fafb;
+      color: #111827;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button.primary { background: #111827; color: #ffffff; border-color: #111827; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    #status { font-size: 13px; color: #374151; }
+    textarea {
+      width: 100%;
+      min-height: 140px;
+      box-sizing: border-box;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      padding: 10px;
+      resize: vertical;
+      font: 14px/1.45 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      background: #ffffff;
+      color: #111827;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { color: #e5e7eb; }
+      .wrap { background: #111827; border-color: #374151; }
+      .hint, label, #status { color: #d1d5db; }
+      button { background: #1f2937; color: #f9fafb; border-color: #4b5563; }
+      button.primary { background: #2563eb; border-color: #2563eb; }
+      select, input { background: #030712; color: #f9fafb; border-color: #374151; }
+      textarea { background: #030712; color: #f9fafb; border-color: #374151; }
+    }
+    @media (max-width: 760px) {
+      .settings { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <p class="title">Захват звука вкладки браузера</p>
+    <p class="hint">
+      Нажмите старт, выберите вкладку или окно с видео и включите передачу аудио.
+      В Chrome/Edge для вкладки обычно есть галка "Поделиться аудио вкладки".
+    </p>
+    <div class="settings">
+      <label>
+        Режим обработки
+        <select id="processingMode">
+          <option value="transcription">Только транскрибация</option>
+          <option value="diarization">Диаризация по спикерам</option>
+        </select>
+      </label>
+      <label class="diarization-setting">
+        Мин. спикеров
+        <input id="minSpeakers" type="number" min="1" step="1" placeholder="auto" />
+      </label>
+      <label class="diarization-setting">
+        Макс. спикеров
+        <input id="maxSpeakers" type="number" min="1" step="1" placeholder="auto" />
+      </label>
+      <label class="diarization-setting">
+        Модель диаризации
+        <input id="diarizationModelPath" type="text" placeholder="пусто = pyannote-community/speaker-diarization-community-1" />
+      </label>
+    </div>
+    <div class="row">
+      <button id="start" class="primary" type="button">Начать захват</button>
+      <button id="stop" type="button" disabled>Остановить</button>
+      <button id="copy" type="button">Копировать текст</button>
+    </div>
+    <div id="status">Захват не запущен.</div>
+    <textarea id="transcript" readonly placeholder="Здесь будет появляться транскрипция звука вкладки..."></textarea>
+  </div>
+
+  <script>
+    const state = {
+      sessionId: "",
+      stream: null,
+      audioStream: null,
+      recorder: null,
+      stopping: false,
+      pollTimer: null,
+      segmentMs: __BROWSER_CAPTURE_SEGMENT_MS__,
+      transcript: "",
+    };
+
+    const startBtn = document.getElementById("start");
+    const stopBtn = document.getElementById("stop");
+    const copyBtn = document.getElementById("copy");
+    const statusEl = document.getElementById("status");
+    const transcriptEl = document.getElementById("transcript");
+    const processingModeEl = document.getElementById("processingMode");
+    const minSpeakersEl = document.getElementById("minSpeakers");
+    const maxSpeakersEl = document.getElementById("maxSpeakers");
+    const diarizationModelPathEl = document.getElementById("diarizationModelPath");
+    const diarizationSettingEls = Array.from(document.querySelectorAll(".diarization-setting"));
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function setParentValue(elemId, value) {
+      try {
+        const parentDoc = window.parent.document;
+        const root = parentDoc.getElementById(elemId);
+        if (!root) return;
+        const field = root.querySelector("textarea, input");
+        if (!field) return;
+        const win = window.parent;
+        const proto = field.tagName === "TEXTAREA"
+          ? win.HTMLTextAreaElement.prototype
+          : win.HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+        setter.call(field, value);
+        field.dispatchEvent(new Event("input", { bubbles: true }));
+        field.dispatchEvent(new Event("change", { bubbles: true }));
+      } catch (_err) {
+        // Parent sync is best-effort; the local preview still works.
+      }
+    }
+
+    function syncTranscript(text) {
+      state.transcript = text || "";
+      transcriptEl.value = state.transcript;
+      setParentValue("transcription_output", state.transcript);
+    }
+
+    function syncSessionId(sessionId) {
+      state.sessionId = sessionId || "";
+      setParentValue("browser_capture_session", state.sessionId);
+    }
+
+    function setSettingsDisabled(disabled) {
+      [processingModeEl, minSpeakersEl, maxSpeakersEl, diarizationModelPathEl]
+        .forEach((elem) => { elem.disabled = disabled; });
+    }
+
+    function toggleDiarizationSettings() {
+      const enabled = processingModeEl.value === "diarization";
+      diarizationSettingEls.forEach((elem) => {
+        elem.style.display = enabled ? "grid" : "none";
+      });
+      transcriptEl.placeholder = enabled
+        ? "Здесь будет появляться диаризованная транскрипция звука вкладки..."
+        : "Здесь будет появляться транскрипция звука вкладки...";
+    }
+
+    function preferredMimeType() {
+      const types = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "video/webm;codecs=opus",
+        "video/webm"
+      ];
+      return types.find((type) => MediaRecorder.isTypeSupported(type)) || "";
+    }
+
+    async function startSession() {
+      const form = new FormData();
+      form.append("mode", processingModeEl.value);
+      form.append("min_speakers", minSpeakersEl.value || "");
+      form.append("max_speakers", maxSpeakersEl.value || "");
+      form.append("diarization_model_path", diarizationModelPathEl.value || "");
+      const response = await fetch("/api/browser-capture/start", {
+        method: "POST",
+        body: form,
+      });
+      if (!response.ok) throw new Error("Не удалось создать сессию захвата.");
+      const data = await response.json();
+      syncSessionId(data.session_id);
+      syncTranscript("");
+      setStatus(data.status || "Захват запущен.");
+    }
+
+    async function sendChunk(blob) {
+      if (!state.sessionId || !blob || blob.size === 0) return;
+      const form = new FormData();
+      form.append("session_id", state.sessionId);
+      form.append("file", blob, `browser-audio-${Date.now()}.webm`);
+      const response = await fetch("/api/browser-capture/chunk", {
+        method: "POST",
+        body: form,
+      });
+      if (!response.ok) throw new Error("Сервер не принял аудиосегмент.");
+      const data = await response.json();
+      syncTranscript(data.transcript || "");
+      setStatus(data.status || "Сегмент обработан.");
+    }
+
+    function recordNextSegment() {
+      if (state.stopping || !state.audioStream) return;
+
+      const chunks = [];
+      const mimeType = preferredMimeType();
+      state.recorder = new MediaRecorder(
+        state.audioStream,
+        mimeType ? { mimeType } : undefined
+      );
+
+      state.recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) chunks.push(event.data);
+      };
+
+      state.recorder.onerror = (event) => {
+        setStatus(`Ошибка записи аудио: ${event.error?.message || event.type}`);
+      };
+
+      state.recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: state.recorder.mimeType || "audio/webm" });
+        try {
+          if (blob.size > 0) {
+            setStatus("Отправляю аудиосегмент на распознавание...");
+            await sendChunk(blob);
+          }
+        } catch (err) {
+          setStatus(err.message || String(err));
+        }
+        if (!state.stopping) {
+          window.setTimeout(recordNextSegment, 250);
+        }
+      };
+
+      state.recorder.start();
+      window.setTimeout(() => {
+        if (state.recorder && state.recorder.state === "recording") {
+          state.recorder.stop();
+        }
+      }, state.segmentMs);
+    }
+
+    async function pollStatus() {
+      if (!state.sessionId) return;
+      try {
+        const response = await fetch(`/api/browser-capture/status/${state.sessionId}`);
+        if (!response.ok) return;
+        const data = await response.json();
+        syncTranscript(data.transcript || "");
+        setStatus(data.status || "Захват идет...");
+      } catch (_err) {
+        // Polling is auxiliary; chunk uploads also update the preview.
+      }
+    }
+
+    async function startCapture() {
+      if (!navigator.mediaDevices?.getDisplayMedia) {
+        setStatus("Браузер не поддерживает захват вкладки/экрана.");
+        return;
+      }
+
+      startBtn.disabled = true;
+      setSettingsDisabled(true);
+      try {
+        await startSession();
+        state.stopping = false;
+        state.stream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true,
+        });
+        const audioTracks = state.stream.getAudioTracks();
+        if (!audioTracks.length) {
+          throw new Error("Аудиодорожка не выбрана. Повторите старт и включите передачу аудио вкладки.");
+        }
+        state.audioStream = new MediaStream(audioTracks);
+        state.stream.getTracks().forEach((track) => {
+          track.onended = stopCapture;
+        });
+        stopBtn.disabled = false;
+        setStatus(
+          processingModeEl.value === "diarization"
+            ? "Захват идет. Диаризация обновляется сегментами."
+            : "Захват идет. Транскрипция обновляется сегментами."
+        );
+        state.pollTimer = window.setInterval(pollStatus, 2000);
+        recordNextSegment();
+      } catch (err) {
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        setSettingsDisabled(false);
+        setStatus(err.message || String(err));
+      }
+    }
+
+    async function stopCapture() {
+      state.stopping = true;
+      stopBtn.disabled = true;
+      startBtn.disabled = false;
+      setSettingsDisabled(false);
+
+      if (state.recorder && state.recorder.state === "recording") {
+        state.recorder.stop();
+      }
+      if (state.stream) {
+        state.stream.getTracks().forEach((track) => track.stop());
+      }
+      if (state.audioStream) {
+        state.audioStream.getTracks().forEach((track) => track.stop());
+      }
+      if (state.pollTimer) {
+        window.clearInterval(state.pollTimer);
+      }
+
+      if (state.sessionId) {
+        const form = new FormData();
+        form.append("session_id", state.sessionId);
+        try {
+          const response = await fetch("/api/browser-capture/stop", {
+            method: "POST",
+            body: form,
+          });
+          if (response.ok) {
+            const data = await response.json();
+            syncTranscript(data.transcript || state.transcript);
+            setStatus(data.status || "Захват остановлен.");
+          }
+        } catch (_err) {
+          setStatus("Захват остановлен.");
+        }
+      } else {
+        setStatus("Захват остановлен.");
+      }
+    }
+
+    startBtn.addEventListener("click", startCapture);
+    stopBtn.addEventListener("click", stopCapture);
+    processingModeEl.addEventListener("change", toggleDiarizationSettings);
+    toggleDiarizationSettings();
+    copyBtn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(state.transcript || transcriptEl.value || "");
+        setStatus("Текст скопирован.");
+      } catch (_err) {
+        transcriptEl.select();
+        setStatus("Скопируйте выделенный текст вручную.");
+      }
+    });
+  </script>
+</body>
+</html>
+""".replace("__BROWSER_CAPTURE_SEGMENT_MS__", str(BROWSER_CAPTURE_SEGMENT_MS))
+
+
+def transcribe_and_create_file(
+    audio_path,
+    video_path,
+    enable_diarization=False,
+    min_speakers=None,
+    max_speakers=None,
+    hf_token=None,
+    diarization_model_path=None,
+):
+    result = transcribe_audio(
+        audio_path=audio_path,
+        video_path=video_path,
+        enable_diarization=enable_diarization,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        hf_token=hf_token,
+        diarization_model_path=diarization_model_path,
+    )
+    path = create_file_with_uuid(result)
+    return [gr.DownloadButton(label="Скачать", value=path, visible=True), result]
+
+
+def transcribe_video_on_play(
+    auto_transcribe,
+    video_path,
+    enable_diarization=False,
+    min_speakers=None,
+    max_speakers=None,
+    hf_token=None,
+    diarization_model_path=None,
+    last_live_key=None,
+):
+    if not auto_transcribe or not video_path:
+        yield [gr.update(), gr.update(), last_live_key]
+        return
+
+    token_fingerprint = (
+        hashlib.sha256(hf_token.encode("utf-8")).hexdigest()[:12]
+        if hf_token
+        else ""
+    )
+    live_key = repr(
+        (
+            str(video_path),
+            bool(enable_diarization),
+            min_speakers,
+            max_speakers,
+            token_fingerprint,
+            diarization_model_path,
+        )
+    )
+    if live_key == last_live_key:
+        yield [gr.update(), gr.update(), last_live_key]
+        return
+
+    final_text = ""
+    for partial_text in transcribe_audio_live(
+        audio_path=None,
+        video_path=video_path,
+        enable_diarization=enable_diarization,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        hf_token=hf_token,
+        diarization_model_path=diarization_model_path,
+    ):
+        final_text = partial_text
+        yield [
+            gr.DownloadButton(visible=False),
+            partial_text,
+            live_key,
+        ]
+
+    path = create_file_with_uuid(final_text)
+    yield [
+        gr.DownloadButton(label="Скачать", value=path, visible=True),
+        final_text,
+        live_key,
+    ]
+
+
+def process_and_create_file(
+    text,
+    model_name=SUMMARY_MODEL_NAME,
+    max_chunk_size=SUMMARY_MAX_CHUNK_SIZE,
+    make_protocol=True,
+    summary_prompt=None,
+    protocol_prompt=None,
+):
+    result = summarize_text_with_prompt_optimized(
+        text,
+        model_name,
+        max_chunk_size,
+        make_protocol,
+        summary_prompt,
+        protocol_prompt,
+    )
+    path = create_file_with_uuid(result)
+    return [gr.DownloadButton(label="Скачать", value=path, visible=True), result]
+
+
+def test_file_create(text):
+    path = create_file_with_uuid(text)
+    return gr.DownloadButton(label="Скачать", value=path, visible=True)
+
+
+INITIAL_HF_TOKEN = _load_saved_hf_token()
+
+
+with gr.Blocks(title="Транскрибация, диаризация и суммаризация") as demo:
+    gr.Markdown("# Транскрибация, диаризация и суммаризация")
+    gr.Markdown(f"Модель суммаризации и протокола: `{SUMMARY_MODEL_NAME}`")
+    live_transcription_key = gr.State(value=None)
+    hf_token_state = gr.State(value=INITIAL_HF_TOKEN)
+
+    with gr.Accordion("Доступ Hugging Face", open=not bool(INITIAL_HF_TOKEN)):
+        hf_token_input = gr.Textbox(
+            label="Hugging Face token",
+            type="password",
+            placeholder="Нужен для скачивания gated-моделей pyannote/Gemma из Hugging Face",
+        )
+        with gr.Row():
+            save_hf_token_btn = gr.Button("Сохранить токен")
+            clear_hf_token_btn = gr.Button("Очистить токен")
+        hf_token_status = gr.Markdown(_mask_token(INITIAL_HF_TOKEN))
+
+    with gr.Tab("Транскрибация"):
+        with gr.Row():
+            with gr.Column():
+                audio_input = gr.Audio(label="Загрузить аудио", type="filepath")
+                video_input = gr.Video(
+                    label="Загрузить или записать видео",
+                    sources=["upload", "webcam"],
+                    include_audio=True,
+                )
+
+                with gr.Accordion("Настройки диаризации", open=True):
+                    diarization_input = gr.Checkbox(
+                        label="Разделять речь по спикерам",
+                        value=False,
+                    )
+                    with gr.Row():
+                        min_speakers_input = gr.Number(
+                            label="Мин. спикеров",
+                            precision=0,
+                        )
+                        max_speakers_input = gr.Number(
+                            label="Макс. спикеров",
+                            precision=0,
+                        )
+                    diarization_model_path_input = gr.Textbox(
+                        label="Локальный путь или HF id модели диаризации",
+                        placeholder="Например: model_cache/pyannote/speaker-diarization",
+                    )
+
+                auto_video_transcribe = gr.Checkbox(
+                    label="Потоково транскрибировать видео при запуске воспроизведения",
+                    value=False,
+                )
+                transcribe_btn = gr.Button("Транскрибировать", variant="primary")
+
+            with gr.Column():
+                text_output = gr.Textbox(
+                    label="Транскрибация",
+                    lines=16,
+                    elem_id="transcription_output",
+                )
+                download_transcription = gr.DownloadButton(visible=False)
+                with gr.Row():
+                    summarize_btn = gr.Button("Суммаризировать транскрибацию")
+                    protocol_btn = gr.Button("Сделать протокол")
+                with gr.Accordion("Промпты суммаризации и протокола", open=False):
+                    gr.Markdown(
+                        "Можно использовать `{summary}` или `{text}`. "
+                        "Если плейсхолдер не указан, материал будет добавлен в конец промпта."
+                    )
+                    summary_prompt_input = gr.Textbox(
+                        label="Промпт для суммаризации",
+                        value=DEFAULT_SUMMARY_PROMPT,
+                        lines=9,
+                    )
+                    protocol_prompt_input = gr.Textbox(
+                        label="Промпт для протокола",
+                        value=DEFAULT_PROTOCOL_PROMPT,
+                        lines=10,
+                    )
+                summary_output = gr.Textbox(label="Результат", lines=8)
+                download_result = gr.DownloadButton(visible=False)
+
+    with gr.Tab("Суммаризация"):
+        gr.Markdown("# Суммаризация и протоколирование")
+        with gr.Column():
+            text_input_tab2 = gr.Textbox(label="Текст", lines=8)
+            with gr.Row():
+                summarize_btn_tab2 = gr.Button("Суммаризировать")
+                protocol_btn_tab2 = gr.Button("Создать протокол")
+            with gr.Accordion("Промпты суммаризации и протокола", open=False):
+                gr.Markdown(
+                    "Можно использовать `{summary}` или `{text}`. "
+                    "Если плейсхолдер не указан, материал будет добавлен в конец промпта."
+                )
+                summary_prompt_tab2 = gr.Textbox(
+                    label="Промпт для суммаризации",
+                    value=DEFAULT_SUMMARY_PROMPT,
+                    lines=9,
+                )
+                protocol_prompt_tab2 = gr.Textbox(
+                    label="Промпт для протокола",
+                    value=DEFAULT_PROTOCOL_PROMPT,
+                    lines=10,
+                )
+            text_tab2_output = gr.Textbox(label="Результат", lines=8)
+            download_result_tab2 = gr.DownloadButton(visible=False)
+
+    with gr.Tab("Захват из браузера"):
+        gr.Markdown(
+            "Используйте этот режим, когда видео нельзя скачать. "
+            "Браузер будет передавать звук выбранной вкладки или окна локальному серверу."
+        )
+        gr.HTML(
+            '<iframe src="/browser-capture-widget" '
+            'allow="display-capture; microphone; camera" '
+            'style="width:100%; min-height:460px; border:0; border-radius:8px;"></iframe>'
+        )
+        browser_capture_session = gr.Textbox(
+            label="ID сессии захвата",
+            visible="hidden",
+            elem_id="browser_capture_session",
+        )
+        sync_browser_capture_btn = gr.Button(
+            "Загрузить текст захвата в поле транскрибации",
+            variant="primary",
+        )
+
+    transcribe_inputs = [
+        audio_input,
+        video_input,
+        diarization_input,
+        min_speakers_input,
+        max_speakers_input,
+        hf_token_state,
+        diarization_model_path_input,
+    ]
+
+    transcribe_btn.click(
+        fn=transcribe_and_create_file,
+        inputs=transcribe_inputs,
+        outputs=[download_transcription, text_output],
+    )
+
+    video_input.play(
+        fn=transcribe_video_on_play,
+        inputs=[
+            auto_video_transcribe,
+            video_input,
+            diarization_input,
+            min_speakers_input,
+            max_speakers_input,
+            hf_token_state,
+            diarization_model_path_input,
+            live_transcription_key,
+        ],
+        outputs=[download_transcription, text_output, live_transcription_key],
+    )
+
+    sync_browser_capture_btn.click(
+        fn=load_browser_capture_text,
+        inputs=[browser_capture_session],
+        outputs=[download_transcription, text_output],
+    )
+
+    save_hf_token_btn.click(
+        fn=save_hf_token,
+        inputs=[hf_token_input],
+        outputs=[hf_token_state, hf_token_input, hf_token_status],
+    )
+
+    clear_hf_token_btn.click(
+        fn=clear_hf_token,
+        inputs=[],
+        outputs=[hf_token_state, hf_token_input, hf_token_status],
+    )
+
+    summarize_btn.click(
+        fn=lambda text, summary_prompt, protocol_prompt: process_and_create_file(
+            text,
+            SUMMARY_MODEL_NAME,
+            SUMMARY_MAX_CHUNK_SIZE,
+            False,
+            summary_prompt,
+            protocol_prompt,
+        ),
+        inputs=[text_output, summary_prompt_input, protocol_prompt_input],
+        outputs=[download_result, summary_output],
+    )
+
+    protocol_btn.click(
+        fn=lambda text, summary_prompt, protocol_prompt: process_and_create_file(
+            text,
+            SUMMARY_MODEL_NAME,
+            SUMMARY_MAX_CHUNK_SIZE,
+            True,
+            summary_prompt,
+            protocol_prompt,
+        ),
+        inputs=[text_output, summary_prompt_input, protocol_prompt_input],
+        outputs=[download_result, summary_output],
+    )
+
+    summarize_btn_tab2.click(
+        fn=lambda text, summary_prompt, protocol_prompt: process_and_create_file(
+            text,
+            SUMMARY_MODEL_NAME,
+            SUMMARY_MAX_CHUNK_SIZE,
+            False,
+            summary_prompt,
+            protocol_prompt,
+        ),
+        inputs=[text_input_tab2, summary_prompt_tab2, protocol_prompt_tab2],
+        outputs=[download_result_tab2, text_tab2_output],
+    )
+
+    protocol_btn_tab2.click(
+        fn=lambda text, summary_prompt, protocol_prompt: process_and_create_file(
+            text,
+            SUMMARY_MODEL_NAME,
+            SUMMARY_MAX_CHUNK_SIZE,
+            True,
+            summary_prompt,
+            protocol_prompt,
+        ),
+        inputs=[text_input_tab2, summary_prompt_tab2, protocol_prompt_tab2],
+        outputs=[download_result_tab2, text_tab2_output],
+    )
+
+
+def create_app(auth=None, server_name="127.0.0.1", server_port=3002):
+    app = FastAPI()
+
+    @app.get("/browser-capture-widget", response_class=HTMLResponse)
+    async def browser_capture_widget():
+        return HTMLResponse(_browser_capture_widget_html())
+
+    @app.post("/api/browser-capture/start")
+    async def browser_capture_start(
+        mode: str = Form(BROWSER_CAPTURE_MODE_TRANSCRIPTION),
+        min_speakers: str = Form(""),
+        max_speakers: str = Form(""),
+        diarization_model_path: str = Form(""),
+    ):
+        session_id = str(uuid.uuid4())
+        now = time.time()
+        mode = _normalize_browser_capture_mode(mode)
+        status = (
+            "Сессия захвата с диаризацией создана."
+            if mode == BROWSER_CAPTURE_MODE_DIARIZATION
+            else "Сессия захвата создана."
+        )
+        with BROWSER_CAPTURE_LOCK:
+            BROWSER_CAPTURE_SESSIONS[session_id] = {
+                "transcript": "",
+                "status": status,
+                "chunks": 0,
+                "running": True,
+                "errors": [],
+                "mode": mode,
+                "min_speakers": (min_speakers or "").strip(),
+                "max_speakers": (max_speakers or "").strip(),
+                "diarization_model_path": (diarization_model_path or "").strip(),
+                "created_at": now,
+                "updated_at": now,
+            }
+        return JSONResponse(_browser_session_snapshot(session_id))
+
+    @app.post("/api/browser-capture/chunk")
+    async def browser_capture_chunk(
+        session_id: str = Form(...),
+        file: UploadFile = File(...),
+    ):
+        session_id = session_id.strip()
+        if not session_id:
+            return JSONResponse(
+                {"status": "Не передан ID сессии.", "transcript": ""},
+                status_code=400,
+            )
+
+        with BROWSER_CAPTURE_LOCK:
+            session = BROWSER_CAPTURE_SESSIONS.get(session_id)
+            if not session:
+                return JSONResponse(
+                    {"status": "Сессия захвата не найдена.", "transcript": ""},
+                    status_code=404,
+                )
+            mode = session.get("mode", BROWSER_CAPTURE_MODE_TRANSCRIPTION)
+            session["status"] = (
+                "Получен аудиосегмент, распознаю и разделяю спикеров..."
+                if mode == BROWSER_CAPTURE_MODE_DIARIZATION
+                else "Получен аудиосегмент, распознаю..."
+            )
+
+        suffix = Path(file.filename or "audio.webm").suffix or ".webm"
+        chunk_path = BROWSER_CAPTURE_DIR / f"{session_id}-{uuid.uuid4()}{suffix}"
+        chunk_path.write_bytes(await file.read())
+        snapshot = await run_in_threadpool(
+            _transcribe_browser_capture_chunk,
+            session_id,
+            chunk_path,
+        )
+        return JSONResponse(snapshot)
+
+    @app.get("/api/browser-capture/status/{session_id}")
+    async def browser_capture_status(session_id: str):
+        return JSONResponse(_browser_session_snapshot(session_id))
+
+    @app.post("/api/browser-capture/stop")
+    async def browser_capture_stop(session_id: str = Form(...)):
+        session_id = session_id.strip()
+        with BROWSER_CAPTURE_LOCK:
+            session = BROWSER_CAPTURE_SESSIONS.get(session_id)
+            if session:
+                session["running"] = False
+                session["status"] = "Захват остановлен."
+                session["updated_at"] = time.time()
+        return JSONResponse(_browser_session_snapshot(session_id))
+
+    return gr.mount_gradio_app(
+        app,
+        demo.queue(default_concurrency_limit=1),
+        path="/",
+        server_name=server_name,
+        server_port=server_port,
+        auth=auth,
+        allowed_paths=[str(OUTPUT_DIR.resolve()), str(UPLOAD_DIR.resolve())],
+    )
+
+
+if __name__ == "__main__":
+    server_port = int(os.getenv("GRADIO_SERVER_PORT", "3002"))
+    username = os.getenv("GRADIO_AUTH_USER", "")
+    password = os.getenv("GRADIO_AUTH_PASSWORD", "")
+    auth = (username, password) if username and password else None
+
+    server_name = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
+    app = create_app(auth=auth, server_name=server_name, server_port=server_port)
+    print(f"* Running on local URL:  http://{server_name}:{server_port}")
+    uvicorn.run(
+        app,
+        host=server_name,
+        port=server_port,
+        log_level=os.getenv("UVICORN_LOG_LEVEL", "info"),
+    )

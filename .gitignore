@@ -1,0 +1,15 @@
+/model_cache/
+/model_cache/hf_token.txt
+/.venv/
+/output_files/
+/uploads/
+/browser_capture_chunks/
+/.idea/
+/.vscode/
+
+__pycache__/
+*.py[cod]
+*.log
+
+.env
+.env.*

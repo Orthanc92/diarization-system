@@ -1,0 +1,28 @@
+services:
+  app:
+    build: .
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./output_files:/app/output_files
+      - ./model_cache:/app/model_cache
+    environment:
+      # Для диаризации можно передать токен здесь или вводить его в UI.
+      - HF_TOKEN=${HF_TOKEN:-}
+      # Для полностью локального режима укажите путь внутри контейнера,
+      # например /app/model_cache/pyannote/speaker-diarization.
+      - DIARIZATION_MODEL_NAME=${DIARIZATION_MODEL_NAME:-pyannote-community/speaker-diarization-community-1}
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
+      - PYANNOTE_METRICS_ENABLED=${PYANNOTE_METRICS_ENABLED:-0}
+      - SUMMARY_MODEL_NAME=${SUMMARY_MODEL_NAME:-google/gemma-4-E4B-it}
+      - SUMMARY_MAX_CHUNK_SIZE=${SUMMARY_MAX_CHUNK_SIZE:-4096}
+      - LIVE_TRANSCRIPTION_UPDATE_SECONDS=${LIVE_TRANSCRIPTION_UPDATE_SECONDS:-5}
+      - BROWSER_CAPTURE_SEGMENT_MS=${BROWSER_CAPTURE_SEGMENT_MS:-60000}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu] 
