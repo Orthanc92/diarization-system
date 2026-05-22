@@ -12,7 +12,7 @@ import torch
 
 # Configuration
 TEMPERATURE = 0.3
-NEW_TOKENS = 800
+NEW_TOKENS = int(os.getenv("SUMMARY_MAX_NEW_TOKENS", "800"))
 SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL_NAME", "google/gemma-4-E4B-it")
 SUMMARY_MAX_CHUNK_SIZE = int(os.getenv("SUMMARY_MAX_CHUNK_SIZE", "4096"))
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL_NAME", "large-v3")
@@ -148,6 +148,7 @@ def _default_model_settings():
         "whisper_num_workers": WHISPER_NUM_WORKERS,
         "summary_model_name": SUMMARY_MODEL_NAME,
         "summary_max_chunk_size": SUMMARY_MAX_CHUNK_SIZE,
+        "summary_max_new_tokens": NEW_TOKENS,
     }
 
 
@@ -213,6 +214,9 @@ def _load_model_settings_from_disk():
     settings["summary_max_chunk_size"] = _positive_int(
         settings.get("summary_max_chunk_size"), SUMMARY_MAX_CHUNK_SIZE, minimum=256
     )
+    settings["summary_max_new_tokens"] = _positive_int(
+        settings.get("summary_max_new_tokens"), NEW_TOKENS, minimum=64
+    )
     return settings
 
 
@@ -267,6 +271,7 @@ def update_model_settings(
     whisper_num_workers=None,
     summary_model_name=None,
     summary_max_chunk_size=None,
+    summary_max_new_tokens=None,
 ):
     global MODEL_SETTINGS
 
@@ -296,6 +301,11 @@ def update_model_settings(
         old_settings["summary_max_chunk_size"],
         minimum=256,
     )
+    new_settings["summary_max_new_tokens"] = _positive_int(
+        summary_max_new_tokens,
+        old_settings["summary_max_new_tokens"],
+        minimum=64,
+    )
 
     _resolve_whisper_device(new_settings["whisper_device"])
 
@@ -307,7 +317,11 @@ def update_model_settings(
         "whisper_cpu_threads",
         "whisper_num_workers",
     }
-    summary_keys = {"summary_model_name", "summary_max_chunk_size"}
+    summary_keys = {
+        "summary_model_name",
+        "summary_max_chunk_size",
+        "summary_max_new_tokens",
+    }
 
     MODEL_SETTINGS = new_settings
     _save_model_settings_to_disk(new_settings)
@@ -1009,6 +1023,7 @@ def process_text_with_instruction(
     instruction,
     model_name=None,
     max_chunk_size=None,
+    max_new_tokens=None,
 ):
     """Run a free-form user instruction against pasted text or a transcript."""
     try:
@@ -1026,9 +1041,19 @@ def process_text_with_instruction(
             settings["summary_max_chunk_size"],
             minimum=256,
         )
+        max_new_tokens = _positive_int(
+            max_new_tokens,
+            settings["summary_max_new_tokens"],
+            minimum=64,
+        )
 
         tokenizer, model = load_hf_model(model_name)
-        generation_config = build_generation_config(model_name, model, tokenizer)
+        generation_config = build_generation_config(
+            model_name,
+            model,
+            tokenizer,
+            max_new_tokens=max_new_tokens,
+        )
         chunks = split_text_into_chunks(text, tokenizer, max_tokens=max_chunk_size)
 
         if len(chunks) == 1:
@@ -1084,6 +1109,7 @@ def summarize_text_with_prompt_optimized(
     text,
     model_name=None,
     max_chunk_size=None,
+    max_new_tokens=None,
     make_protocol=True,
     summary_prompt=None,
     protocol_prompt=None,
@@ -1104,9 +1130,19 @@ def summarize_text_with_prompt_optimized(
             settings["summary_max_chunk_size"],
             minimum=256,
         )
+        max_new_tokens = _positive_int(
+            max_new_tokens,
+            settings["summary_max_new_tokens"],
+            minimum=64,
+        )
 
         tokenizer, model = load_hf_model(model_name)
-        generation_config = build_generation_config(model_name, model, tokenizer)
+        generation_config = build_generation_config(
+            model_name,
+            model,
+            tokenizer,
+            max_new_tokens=max_new_tokens,
+        )
 
         chunks = split_text_into_chunks(text, tokenizer, max_tokens=max_chunk_size)
         summaries = []

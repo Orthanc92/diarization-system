@@ -63,6 +63,7 @@ Open `Настройки моделей` in the UI to change:
 - Whisper compute type and batch size
 - summary/protocol Hugging Face model id or one of the recommended presets
 - summary chunk size
+- maximum new tokens for each LLM response
 
 Settings are stored locally in:
 

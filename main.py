@@ -80,6 +80,21 @@ def _recommended_summary_models_markdown():
     )
 
 
+def _generation_token_recommendations_markdown():
+    return (
+        "#### Справка по длине ответа модели\n\n"
+        "`Макс. токенов ответа` - это лимит генерации на один вызов LLM. "
+        "Для длинных текстов он применяется к каждому фрагменту и к финальному объединению, "
+        "поэтому большие значения заметно увеличивают время обработки и расход VRAM.\n\n"
+        "| Значение | Для чего подходит |\n"
+        "| --- | --- |\n"
+        "| 512-800 | короткое саммари, список вопросов, быстрый анализ |\n"
+        "| 1000-1500 | обычный протокол, структурный разбор, задачи и выводы |\n"
+        "| 2000-3000 | подробный протокол, большой список вопросов, глубокий анализ |\n"
+        "| 4000+ | только если модель и видеопамять выдерживают; возможны повторы и сильное замедление |"
+    )
+
+
 def _mask_token(token):
     token = (token or "").strip()
     if not token:
@@ -151,7 +166,8 @@ def _model_settings_markdown(settings=None):
         f"compute `{settings['whisper_resolved_compute_type']}`; "
         f"batch `{settings['whisper_batch_size']}`.\n"
         f"- LLM summary/protocol: `{settings['summary_model_name']}`; "
-        f"размер чанка `{settings['summary_max_chunk_size']}` токенов.\n"
+        f"размер чанка `{settings['summary_max_chunk_size']}` токенов; "
+        f"ответ до `{settings['summary_max_new_tokens']}` новых токенов.\n"
         f"- CUDA: {cuda_status}."
     )
 
@@ -165,6 +181,7 @@ def save_model_settings_ui(
     whisper_num_workers,
     summary_model_name,
     summary_max_chunk_size,
+    summary_max_new_tokens,
 ):
     try:
         settings = update_model_settings(
@@ -176,6 +193,7 @@ def save_model_settings_ui(
             whisper_num_workers=whisper_num_workers,
             summary_model_name=summary_model_name,
             summary_max_chunk_size=summary_max_chunk_size,
+            summary_max_new_tokens=summary_max_new_tokens,
         )
         return [
             _model_settings_markdown(settings),
@@ -879,6 +897,13 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
                     precision=0,
                     info="Меньше чанки стабильнее, но больше проходов модели. Обычно 3072-4096.",
                 )
+                summary_max_new_tokens_input = gr.Number(
+                    label="Макс. токенов ответа модели",
+                    value=INITIAL_MODEL_SETTINGS["summary_max_new_tokens"],
+                    precision=0,
+                    info="Лимит новых токенов на один ответ LLM. Увеличьте для подробных протоколов и анализа больших текстов.",
+                )
+                gr.Markdown(_generation_token_recommendations_markdown())
                 gr.Markdown(
                     "Подсказка: на RTX 4090 для Whisper обычно выбирайте `auto`/`float16`. "
                     "Если параллельно загружена LLM и не хватает VRAM, временно переключите Whisper на `cpu` "
@@ -1088,6 +1113,7 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
             whisper_num_workers_input,
             summary_model_input,
             summary_chunk_input,
+            summary_max_new_tokens_input,
         ],
         outputs=[model_settings_status, model_settings_save_status],
     )
