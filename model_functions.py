@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import subprocess
 import tempfile
 import gc
@@ -15,6 +16,11 @@ NEW_TOKENS = 800
 SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL_NAME", "google/gemma-4-E4B-it")
 SUMMARY_MAX_CHUNK_SIZE = int(os.getenv("SUMMARY_MAX_CHUNK_SIZE", "4096"))
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL_NAME", "large-v3")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "auto")
+WHISPER_BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE", "32"))
+WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "12"))
+WHISPER_NUM_WORKERS = int(os.getenv("WHISPER_NUM_WORKERS", "6"))
 LIVE_TRANSCRIPTION_UPDATE_SECONDS = float(
     os.getenv("LIVE_TRANSCRIPTION_UPDATE_SECONDS", "5")
 )
@@ -49,13 +55,18 @@ DEFAULT_PROTOCOL_PROMPT = (
 CACHE_DIR = Path.cwd() / "model_cache"
 CACHE_DIR.mkdir(exist_ok=True, parents=True)
 HF_TOKEN_FILE = Path(os.getenv("HF_TOKEN_FILE", str(CACHE_DIR / "hf_token.txt")))
+MODEL_SETTINGS_FILE = Path(
+    os.getenv("MODEL_SETTINGS_FILE", str(CACHE_DIR / "model_settings.json"))
+)
 
 hf_tokenizer = None
 hf_model = None
 hf_model_name = None
 whisper_pipeline = None
+whisper_pipeline_key = None
 diarization_pipeline = None
 diarization_pipeline_name = None
+MODEL_SETTINGS = None
 
 
 def _to_path(value):
@@ -81,6 +92,199 @@ def _optional_int(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _positive_int(value, default, minimum=1):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
+
+
+def _default_model_settings():
+    return {
+        "whisper_model_name": WHISPER_MODEL_NAME,
+        "whisper_device": _normalize_whisper_device(WHISPER_DEVICE),
+        "whisper_compute_type": _normalize_whisper_compute_type(WHISPER_COMPUTE_TYPE),
+        "whisper_batch_size": WHISPER_BATCH_SIZE,
+        "whisper_cpu_threads": WHISPER_CPU_THREADS,
+        "whisper_num_workers": WHISPER_NUM_WORKERS,
+        "summary_model_name": SUMMARY_MODEL_NAME,
+        "summary_max_chunk_size": SUMMARY_MAX_CHUNK_SIZE,
+    }
+
+
+def _normalize_whisper_device(value):
+    value = (value or "auto").strip().lower()
+    return value if value in {"auto", "cuda", "cpu"} else "auto"
+
+
+def _normalize_whisper_compute_type(value):
+    value = (value or "auto").strip().lower()
+    allowed = {"auto", "float16", "int8_float16", "int8", "float32"}
+    return value if value in allowed else "auto"
+
+
+def _resolve_whisper_device(device_mode):
+    device_mode = _normalize_whisper_device(device_mode)
+    if device_mode == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA недоступна. Выберите CPU или auto.")
+        return "cuda"
+    if device_mode == "cpu":
+        return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _resolve_whisper_compute_type(compute_type, resolved_device):
+    compute_type = _normalize_whisper_compute_type(compute_type)
+    if compute_type != "auto":
+        return compute_type
+    return "float16" if resolved_device == "cuda" else "int8"
+
+
+def _load_model_settings_from_disk():
+    settings = _default_model_settings()
+    try:
+        saved_settings = json.loads(MODEL_SETTINGS_FILE.read_text(encoding="utf-8"))
+        if isinstance(saved_settings, dict):
+            settings.update(saved_settings)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    settings["whisper_model_name"] = (
+        settings.get("whisper_model_name") or WHISPER_MODEL_NAME
+    ).strip()
+    settings["whisper_device"] = _normalize_whisper_device(
+        settings.get("whisper_device")
+    )
+    settings["whisper_compute_type"] = _normalize_whisper_compute_type(
+        settings.get("whisper_compute_type")
+    )
+    settings["whisper_batch_size"] = _positive_int(
+        settings.get("whisper_batch_size"), WHISPER_BATCH_SIZE
+    )
+    settings["whisper_cpu_threads"] = _positive_int(
+        settings.get("whisper_cpu_threads"), WHISPER_CPU_THREADS
+    )
+    settings["whisper_num_workers"] = _positive_int(
+        settings.get("whisper_num_workers"), WHISPER_NUM_WORKERS
+    )
+    settings["summary_model_name"] = (
+        settings.get("summary_model_name") or SUMMARY_MODEL_NAME
+    ).strip()
+    settings["summary_max_chunk_size"] = _positive_int(
+        settings.get("summary_max_chunk_size"), SUMMARY_MAX_CHUNK_SIZE, minimum=256
+    )
+    return settings
+
+
+def _save_model_settings_to_disk(settings):
+    MODEL_SETTINGS_FILE.parent.mkdir(exist_ok=True, parents=True)
+    MODEL_SETTINGS_FILE.write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def get_model_settings():
+    settings = dict(MODEL_SETTINGS)
+    try:
+        resolved_device = _resolve_whisper_device(settings["whisper_device"])
+    except RuntimeError:
+        resolved_device = "cpu"
+    settings["cuda_available"] = torch.cuda.is_available()
+    settings["whisper_resolved_device"] = resolved_device
+    settings["whisper_resolved_compute_type"] = _resolve_whisper_compute_type(
+        settings["whisper_compute_type"],
+        resolved_device,
+    )
+    return settings
+
+
+def unload_whisper_model():
+    global whisper_pipeline, whisper_pipeline_key
+    whisper_pipeline = None
+    whisper_pipeline_key = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def unload_hf_model():
+    global hf_tokenizer, hf_model, hf_model_name
+    hf_tokenizer = None
+    hf_model = None
+    hf_model_name = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def update_model_settings(
+    whisper_model_name=None,
+    whisper_device=None,
+    whisper_compute_type=None,
+    whisper_batch_size=None,
+    whisper_cpu_threads=None,
+    whisper_num_workers=None,
+    summary_model_name=None,
+    summary_max_chunk_size=None,
+):
+    global MODEL_SETTINGS
+
+    old_settings = dict(MODEL_SETTINGS)
+    new_settings = dict(old_settings)
+    new_settings["whisper_model_name"] = (
+        whisper_model_name or WHISPER_MODEL_NAME
+    ).strip()
+    new_settings["whisper_device"] = _normalize_whisper_device(whisper_device)
+    new_settings["whisper_compute_type"] = _normalize_whisper_compute_type(
+        whisper_compute_type
+    )
+    new_settings["whisper_batch_size"] = _positive_int(
+        whisper_batch_size, old_settings["whisper_batch_size"]
+    )
+    new_settings["whisper_cpu_threads"] = _positive_int(
+        whisper_cpu_threads, old_settings["whisper_cpu_threads"]
+    )
+    new_settings["whisper_num_workers"] = _positive_int(
+        whisper_num_workers, old_settings["whisper_num_workers"]
+    )
+    new_settings["summary_model_name"] = (
+        summary_model_name or SUMMARY_MODEL_NAME
+    ).strip()
+    new_settings["summary_max_chunk_size"] = _positive_int(
+        summary_max_chunk_size,
+        old_settings["summary_max_chunk_size"],
+        minimum=256,
+    )
+
+    _resolve_whisper_device(new_settings["whisper_device"])
+
+    whisper_keys = {
+        "whisper_model_name",
+        "whisper_device",
+        "whisper_compute_type",
+        "whisper_batch_size",
+        "whisper_cpu_threads",
+        "whisper_num_workers",
+    }
+    summary_keys = {"summary_model_name", "summary_max_chunk_size"}
+
+    MODEL_SETTINGS = new_settings
+    _save_model_settings_to_disk(new_settings)
+
+    if any(old_settings[key] != new_settings[key] for key in whisper_keys):
+        unload_whisper_model()
+    if any(old_settings[key] != new_settings[key] for key in summary_keys):
+        unload_hf_model()
+
+    return get_model_settings()
+
+
+MODEL_SETTINGS = _load_model_settings_from_disk()
 
 
 def _hf_token():
@@ -208,9 +412,25 @@ def get_audio_source(audio_path, video_path, force_wav=False):
 
 
 def load_whisper_pipeline():
-    global whisper_pipeline
-    if whisper_pipeline is not None:
+    global whisper_pipeline, whisper_pipeline_key
+    settings = get_model_settings()
+    resolved_device = _resolve_whisper_device(settings["whisper_device"])
+    compute_type = _resolve_whisper_compute_type(
+        settings["whisper_compute_type"],
+        resolved_device,
+    )
+    pipeline_key = (
+        settings["whisper_model_name"],
+        resolved_device,
+        compute_type,
+        settings["whisper_cpu_threads"],
+        settings["whisper_num_workers"],
+    )
+
+    if whisper_pipeline is not None and whisper_pipeline_key == pipeline_key:
         return whisper_pipeline
+    if whisper_pipeline is not None:
+        unload_whisper_model()
 
     try:
         from faster_whisper import BatchedInferencePipeline, WhisperModel
@@ -219,28 +439,29 @@ def load_whisper_pipeline():
             "Пакет faster-whisper не установлен. Установите зависимости из requirements.txt."
         ) from exc
 
-    cuda_available = torch.cuda.is_available()
     model_kwargs = {
-        "device": "cuda" if cuda_available else "cpu",
-        "compute_type": "float16" if cuda_available else "int8",
-        "cpu_threads": int(os.getenv("WHISPER_CPU_THREADS", "12")),
-        "num_workers": int(os.getenv("WHISPER_NUM_WORKERS", "6")),
+        "device": resolved_device,
+        "compute_type": compute_type,
+        "cpu_threads": settings["whisper_cpu_threads"],
+        "num_workers": settings["whisper_num_workers"],
         "download_root": str(CACHE_DIR / "whisper"),
     }
-    if cuda_available:
+    if resolved_device == "cuda":
         model_kwargs["device_index"] = 0
 
-    model = WhisperModel(WHISPER_MODEL_NAME, **model_kwargs)
+    model = WhisperModel(settings["whisper_model_name"], **model_kwargs)
     whisper_pipeline = BatchedInferencePipeline(model=model)
+    whisper_pipeline_key = pipeline_key
     return whisper_pipeline
 
 
 def unload_transcription_models():
-    global whisper_pipeline, diarization_pipeline, diarization_pipeline_name
+    global whisper_pipeline, whisper_pipeline_key, diarization_pipeline, diarization_pipeline_name
     if whisper_pipeline is None and diarization_pipeline is None:
         return
 
     whisper_pipeline = None
+    whisper_pipeline_key = None
     diarization_pipeline = None
     diarization_pipeline_name = None
     gc.collect()
@@ -254,6 +475,7 @@ def transcribe_segments(audio_path):
 
 def iter_transcribe_segments(audio_path):
     pipeline = load_whisper_pipeline()
+    settings = get_model_settings()
     segments, _info = pipeline.transcribe(
         audio_path,
         language="ru",
@@ -261,7 +483,7 @@ def iter_transcribe_segments(audio_path):
         best_of=2,
         condition_on_previous_text=True,
         vad_filter=True,
-        batch_size=int(os.getenv("WHISPER_BATCH_SIZE", "32")),
+        batch_size=settings["whisper_batch_size"],
         temperature=0.0,
     )
     yield from segments
@@ -536,10 +758,11 @@ def transcribe_audio_live(
             os.remove(temp_audio_path)
 
 
-def load_hf_model(model_name=SUMMARY_MODEL_NAME):
+def load_hf_model(model_name=None):
     global hf_tokenizer, hf_model, hf_model_name
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    model_name = (model_name or get_model_settings()["summary_model_name"]).strip()
     if hf_tokenizer is not None and hf_model is not None and hf_model_name == model_name:
         return hf_tokenizer, hf_model
 
@@ -687,8 +910,8 @@ def generate_chat_text(processor, model, prompt, generation_config):
 
 def summarize_text_with_prompt_optimized(
     text,
-    model_name=SUMMARY_MODEL_NAME,
-    max_chunk_size=SUMMARY_MAX_CHUNK_SIZE,
+    model_name=None,
+    max_chunk_size=None,
     make_protocol=True,
     summary_prompt=None,
     protocol_prompt=None,
@@ -702,6 +925,13 @@ def summarize_text_with_prompt_optimized(
             return "Передайте текст для суммаризации."
 
         text = prepare_text_for_summary(text)
+        settings = get_model_settings()
+        model_name = (model_name or settings["summary_model_name"]).strip()
+        max_chunk_size = _positive_int(
+            max_chunk_size,
+            settings["summary_max_chunk_size"],
+            minimum=256,
+        )
 
         from transformers import GenerationConfig
 

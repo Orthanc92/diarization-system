@@ -10,6 +10,7 @@ speaker diarization, summarization, and meeting protocol generation.
 - Browser tab/window audio capture for videos that cannot be downloaded
 - Summaries and protocols with Gemma
 - Editable prompts for summaries and protocols in the UI
+- Model settings page for Whisper/Gemma, including CPU/GPU selection for Whisper
 - Local Hugging Face token storage in `model_cache/hf_token.txt`
 
 ## Quick Start
@@ -50,4 +51,20 @@ pyannote-community/speaker-diarization-community-1
 
 Model cache, uploaded files, browser capture chunks, output files, and tokens are
 ignored by git.
+
+## Model Settings
+
+Open `Настройки моделей` in the UI to change:
+
+- Whisper model name
+- Whisper device: `auto`, `cuda`, or `cpu`
+- Whisper compute type and batch size
+- Gemma/Hugging Face model id
+- summary chunk size
+
+Settings are stored locally in:
+
+```text
+model_cache/model_settings.json
+```
 

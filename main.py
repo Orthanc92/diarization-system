@@ -14,12 +14,12 @@ from starlette.concurrency import run_in_threadpool
 from model_functions import (
     DEFAULT_PROTOCOL_PROMPT,
     DEFAULT_SUMMARY_PROMPT,
+    get_model_settings,
     HF_TOKEN_FILE,
-    SUMMARY_MAX_CHUNK_SIZE,
-    SUMMARY_MODEL_NAME,
     summarize_text_with_prompt_optimized,
     transcribe_audio,
     transcribe_audio_live,
+    update_model_settings,
 )
 
 UPLOAD_DIR = Path("uploads")
@@ -96,6 +96,53 @@ def clear_hf_token():
         gr.update(value=""),
         "Токен очищен из текущего процесса и локального файла.",
     ]
+
+
+def _model_settings_markdown(settings=None):
+    settings = settings or get_model_settings()
+    cuda_status = "доступна" if settings["cuda_available"] else "недоступна"
+    return (
+        "**Текущие настройки моделей**\n\n"
+        f"- Whisper: `{settings['whisper_model_name']}`; "
+        f"режим `{settings['whisper_device']}` -> `{settings['whisper_resolved_device']}`; "
+        f"compute `{settings['whisper_resolved_compute_type']}`; "
+        f"batch `{settings['whisper_batch_size']}`.\n"
+        f"- Gemma/summary: `{settings['summary_model_name']}`; "
+        f"размер чанка `{settings['summary_max_chunk_size']}` токенов.\n"
+        f"- CUDA: {cuda_status}."
+    )
+
+
+def save_model_settings_ui(
+    whisper_model_name,
+    whisper_device,
+    whisper_compute_type,
+    whisper_batch_size,
+    whisper_cpu_threads,
+    whisper_num_workers,
+    summary_model_name,
+    summary_max_chunk_size,
+):
+    try:
+        settings = update_model_settings(
+            whisper_model_name=whisper_model_name,
+            whisper_device=whisper_device,
+            whisper_compute_type=whisper_compute_type,
+            whisper_batch_size=whisper_batch_size,
+            whisper_cpu_threads=whisper_cpu_threads,
+            whisper_num_workers=whisper_num_workers,
+            summary_model_name=summary_model_name,
+            summary_max_chunk_size=summary_max_chunk_size,
+        )
+        return [
+            _model_settings_markdown(settings),
+            "Настройки сохранены. Если модель уже была загружена, она будет перезагружена при следующем запуске задачи.",
+        ]
+    except Exception as exc:
+        return [
+            _model_settings_markdown(),
+            f"Ошибка сохранения настроек: {exc}",
+        ]
 
 
 def create_file_with_uuid(text, directory=OUTPUT_DIR):
@@ -676,19 +723,15 @@ def transcribe_video_on_play(
 
 def process_and_create_file(
     text,
-    model_name=SUMMARY_MODEL_NAME,
-    max_chunk_size=SUMMARY_MAX_CHUNK_SIZE,
     make_protocol=True,
     summary_prompt=None,
     protocol_prompt=None,
 ):
     result = summarize_text_with_prompt_optimized(
         text,
-        model_name,
-        max_chunk_size,
-        make_protocol,
-        summary_prompt,
-        protocol_prompt,
+        make_protocol=make_protocol,
+        summary_prompt=summary_prompt,
+        protocol_prompt=protocol_prompt,
     )
     path = create_file_with_uuid(result)
     return [gr.DownloadButton(label="Скачать", value=path, visible=True), result]
@@ -700,11 +743,12 @@ def test_file_create(text):
 
 
 INITIAL_HF_TOKEN = _load_saved_hf_token()
+INITIAL_MODEL_SETTINGS = get_model_settings()
 
 
 with gr.Blocks(title="Транскрибация, диаризация и суммаризация") as demo:
     gr.Markdown("# Транскрибация, диаризация и суммаризация")
-    gr.Markdown(f"Модель суммаризации и протокола: `{SUMMARY_MODEL_NAME}`")
+    model_settings_status = gr.Markdown(_model_settings_markdown(INITIAL_MODEL_SETTINGS))
     live_transcription_key = gr.State(value=None)
     hf_token_state = gr.State(value=INITIAL_HF_TOKEN)
 
@@ -718,6 +762,70 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
             save_hf_token_btn = gr.Button("Сохранить токен")
             clear_hf_token_btn = gr.Button("Очистить токен")
         hf_token_status = gr.Markdown(_mask_token(INITIAL_HF_TOKEN))
+
+    with gr.Tab("Настройки моделей"):
+        gr.Markdown(
+            "Здесь можно выбрать модели и устройство. Настройки сохраняются локально в "
+            "`model_cache/model_settings.json` и применяются к следующим задачам."
+        )
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("### Whisper")
+                whisper_model_input = gr.Textbox(
+                    label="Модель Whisper",
+                    value=INITIAL_MODEL_SETTINGS["whisper_model_name"],
+                    placeholder="Например: large-v3, medium, small",
+                )
+                whisper_device_input = gr.Radio(
+                    label="Устройство для Whisper",
+                    choices=["auto", "cuda", "cpu"],
+                    value=INITIAL_MODEL_SETTINGS["whisper_device"],
+                    info="auto использует GPU при наличии CUDA, иначе CPU. CPU медленнее, но не требует видеопамяти.",
+                )
+                whisper_compute_input = gr.Dropdown(
+                    label="Compute type",
+                    choices=["auto", "float16", "int8_float16", "int8", "float32"],
+                    value=INITIAL_MODEL_SETTINGS["whisper_compute_type"],
+                    info="Для GPU обычно лучше auto/float16. Для CPU обычно лучше auto/int8.",
+                )
+                whisper_batch_input = gr.Number(
+                    label="Batch size",
+                    value=INITIAL_MODEL_SETTINGS["whisper_batch_size"],
+                    precision=0,
+                    info="Больше batch быстрее на GPU, но требует больше VRAM. Если ловите OOM, уменьшите.",
+                )
+                whisper_cpu_threads_input = gr.Number(
+                    label="CPU threads",
+                    value=INITIAL_MODEL_SETTINGS["whisper_cpu_threads"],
+                    precision=0,
+                    info="Используется faster-whisper при работе на CPU.",
+                )
+                whisper_num_workers_input = gr.Number(
+                    label="Num workers",
+                    value=INITIAL_MODEL_SETTINGS["whisper_num_workers"],
+                    precision=0,
+                    info="Количество worker-потоков faster-whisper.",
+                )
+            with gr.Column():
+                gr.Markdown("### Gemma / суммаризация")
+                summary_model_input = gr.Textbox(
+                    label="HF id модели для саммари и протокола",
+                    value=INITIAL_MODEL_SETTINGS["summary_model_name"],
+                    placeholder="Например: google/gemma-4-E4B-it",
+                    info="Модель должна помещаться в вашу видеопамять. Для gated-моделей нужен HF token.",
+                )
+                summary_chunk_input = gr.Number(
+                    label="Размер чанка для саммаризации, токены",
+                    value=INITIAL_MODEL_SETTINGS["summary_max_chunk_size"],
+                    precision=0,
+                    info="Меньше чанки стабильнее, но больше проходов модели. Обычно 3072-4096.",
+                )
+                gr.Markdown(
+                    "Подсказка: на RTX 4090 для Whisper обычно выбирайте `auto`/`float16`. "
+                    "Если параллельно загружена Gemma и не хватает VRAM, временно переключите Whisper на `cpu`."
+                )
+        save_model_settings_btn = gr.Button("Сохранить настройки моделей", variant="primary")
+        model_settings_save_status = gr.Markdown("")
 
     with gr.Tab("Транскрибация"):
         with gr.Row():
@@ -876,11 +984,24 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
         outputs=[hf_token_state, hf_token_input, hf_token_status],
     )
 
+    save_model_settings_btn.click(
+        fn=save_model_settings_ui,
+        inputs=[
+            whisper_model_input,
+            whisper_device_input,
+            whisper_compute_input,
+            whisper_batch_input,
+            whisper_cpu_threads_input,
+            whisper_num_workers_input,
+            summary_model_input,
+            summary_chunk_input,
+        ],
+        outputs=[model_settings_status, model_settings_save_status],
+    )
+
     summarize_btn.click(
         fn=lambda text, summary_prompt, protocol_prompt: process_and_create_file(
             text,
-            SUMMARY_MODEL_NAME,
-            SUMMARY_MAX_CHUNK_SIZE,
             False,
             summary_prompt,
             protocol_prompt,
@@ -892,8 +1013,6 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
     protocol_btn.click(
         fn=lambda text, summary_prompt, protocol_prompt: process_and_create_file(
             text,
-            SUMMARY_MODEL_NAME,
-            SUMMARY_MAX_CHUNK_SIZE,
             True,
             summary_prompt,
             protocol_prompt,
@@ -905,8 +1024,6 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
     summarize_btn_tab2.click(
         fn=lambda text, summary_prompt, protocol_prompt: process_and_create_file(
             text,
-            SUMMARY_MODEL_NAME,
-            SUMMARY_MAX_CHUNK_SIZE,
             False,
             summary_prompt,
             protocol_prompt,
@@ -918,8 +1035,6 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
     protocol_btn_tab2.click(
         fn=lambda text, summary_prompt, protocol_prompt: process_and_create_file(
             text,
-            SUMMARY_MODEL_NAME,
-            SUMMARY_MAX_CHUNK_SIZE,
             True,
             summary_prompt,
             protocol_prompt,
