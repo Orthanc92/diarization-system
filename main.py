@@ -14,9 +14,11 @@ from starlette.concurrency import run_in_threadpool
 from model_functions import (
     DEFAULT_PROTOCOL_PROMPT,
     DEFAULT_SUMMARY_PROMPT,
+    DEFAULT_TEXT_TASK_INSTRUCTION,
     RECOMMENDED_SUMMARY_MODELS,
     get_model_settings,
     HF_TOKEN_FILE,
+    process_text_with_instruction,
     summarize_text_with_prompt_optimized,
     transcribe_audio,
     transcribe_audio_live,
@@ -778,6 +780,12 @@ def process_and_create_file(
     return [gr.DownloadButton(label="Скачать", value=path, visible=True), result]
 
 
+def process_text_task_and_create_file(text, instruction):
+    result = process_text_with_instruction(text, instruction)
+    path = create_file_with_uuid(result)
+    return [gr.DownloadButton(label="Скачать", value=path, visible=True), result]
+
+
 def test_file_create(text):
     path = create_file_with_uuid(text)
     return gr.DownloadButton(label="Скачать", value=path, visible=True)
@@ -967,6 +975,33 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
             text_tab2_output = gr.Textbox(label="Результат", lines=8)
             download_result_tab2 = gr.DownloadButton(visible=False)
 
+    with gr.Tab("Работа с текстом"):
+        gr.Markdown("# Свободная работа с текстом")
+        gr.Markdown(
+            "Вставьте транскрипцию или другой текст и напишите задачу для выбранной LLM. "
+            "Можно попросить анализ, список вопросов, план, проверку аргументов, выделение задач или любой другой формат ответа."
+        )
+        with gr.Row():
+            with gr.Column():
+                text_task_input = gr.Textbox(
+                    label="Текст / транскрипция",
+                    lines=16,
+                    placeholder="Вставьте сюда транскрипцию или нажмите кнопку ниже, чтобы взять текст из вкладки транскрибации.",
+                )
+                load_text_task_from_transcription_btn = gr.Button(
+                    "Взять текст из транскрибации"
+                )
+            with gr.Column():
+                text_task_instruction = gr.Textbox(
+                    label="Что сделать с текстом",
+                    value=DEFAULT_TEXT_TASK_INSTRUCTION,
+                    lines=8,
+                    placeholder="Например: составь 10 вопросов по тексту; найди спорные утверждения; сделай план действий.",
+                )
+                run_text_task_btn = gr.Button("Выполнить задачу", variant="primary")
+                text_task_output = gr.Textbox(label="Ответ модели", lines=16)
+                download_text_task = gr.DownloadButton(visible=False)
+
     with gr.Tab("Захват из браузера"):
         gr.Markdown(
             "Используйте этот режим, когда видео нельзя скачать. "
@@ -1099,6 +1134,18 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
         ),
         inputs=[text_input_tab2, summary_prompt_tab2, protocol_prompt_tab2],
         outputs=[download_result_tab2, text_tab2_output],
+    )
+
+    load_text_task_from_transcription_btn.click(
+        fn=lambda text: text,
+        inputs=[text_output],
+        outputs=[text_task_input],
+    )
+
+    run_text_task_btn.click(
+        fn=process_text_task_and_create_file,
+        inputs=[text_task_input, text_task_instruction],
+        outputs=[download_text_task, text_task_output],
     )
 
 

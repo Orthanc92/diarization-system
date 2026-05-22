@@ -82,6 +82,10 @@ DEFAULT_PROTOCOL_PROMPT = (
     "3. Если есть, представь список задач / поручений\n"
     "Ответ подай в деловом стиле, подробно и структурированно."
 )
+DEFAULT_TEXT_TASK_INSTRUCTION = (
+    "Проанализируй транскрипцию. Выдели ключевые темы, важные тезисы, "
+    "открытые вопросы и возможные следующие шаги. Ответ дай структурированно."
+)
 
 # Cache
 CACHE_DIR = Path.cwd() / "model_cache"
@@ -947,16 +951,133 @@ def build_chat_inputs(processor, prompt, model):
         return inputs, inputs["input_ids"].shape[-1]
 
 
-def generate_chat_text(processor, model, prompt, generation_config):
+def build_generation_config(model_name, model, processor, max_new_tokens=NEW_TOKENS):
+    from transformers import GenerationConfig
+
+    generation_kwargs = {"cache_dir": CACHE_DIR}
+    token = _hf_token()
+    if token:
+        generation_kwargs["token"] = token
+    try:
+        generation_config = GenerationConfig.from_pretrained(
+            model_name,
+            **generation_kwargs,
+        )
+    except Exception:
+        generation_config = model.generation_config
+    generation_config.temperature = TEMPERATURE
+    generation_config.top_p = 0.7
+    generation_config.repetition_penalty = 1.2
+    generation_config.max_new_tokens = max_new_tokens
+    generation_config.no_repeat_ngram_size = 6
+    base_tokenizer = _get_tokenizer(processor)
+    generation_config.eos_token_id = base_tokenizer.eos_token_id
+    generation_config.pad_token_id = (
+        base_tokenizer.pad_token_id or base_tokenizer.eos_token_id
+    )
+    generation_config.do_sample = False
+    return generation_config
+
+
+def generate_chat_text(processor, model, prompt, generation_config, clean_output=True):
     inputs, input_len = build_chat_inputs(processor, prompt, model)
     if isinstance(inputs, dict):
         outputs = model.generate(**inputs, generation_config=generation_config)
     else:
         outputs = model.generate(inputs, generation_config=generation_config)
     tokenizer = _get_tokenizer(processor)
-    return clean_generated_text(
-        tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+    text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+    return clean_generated_text(text) if clean_output else text.strip()
+
+
+def render_text_task_prompt(instruction, text):
+    instruction = (instruction or "").strip()
+    text = (text or "").strip()
+    if "{text}" in instruction:
+        return instruction.replace("{text}", text)
+    return (
+        "Выполни пользовательскую задачу по тексту ниже.\n"
+        "Правила: опирайся только на данный текст; не выдумывай факты; "
+        "если данных недостаточно, прямо укажи это.\n\n"
+        f"Задача:\n{instruction}\n\n"
+        f"Текст:\n{text}"
     )
+
+
+def process_text_with_instruction(
+    text,
+    instruction,
+    model_name=None,
+    max_chunk_size=None,
+):
+    """Run a free-form user instruction against pasted text or a transcript."""
+    try:
+        if not text or not text.strip():
+            return "Передайте текст или транскрипцию для обработки."
+        if not instruction or not instruction.strip():
+            return "Опишите, что нужно сделать с текстом."
+
+        text = prepare_text_for_summary(text)
+        instruction = instruction.strip()
+        settings = get_model_settings()
+        model_name = (model_name or settings["summary_model_name"]).strip()
+        max_chunk_size = _positive_int(
+            max_chunk_size,
+            settings["summary_max_chunk_size"],
+            minimum=256,
+        )
+
+        tokenizer, model = load_hf_model(model_name)
+        generation_config = build_generation_config(model_name, model, tokenizer)
+        chunks = split_text_into_chunks(text, tokenizer, max_tokens=max_chunk_size)
+
+        if len(chunks) == 1:
+            return generate_chat_text(
+                tokenizer,
+                model,
+                render_text_task_prompt(instruction, chunks[0]),
+                generation_config,
+                clean_output=False,
+            )
+
+        partial_results = []
+        total_chunks = len(chunks)
+        for index, chunk in enumerate(chunks, start=1):
+            prompt = (
+                "Ниже фрагмент длинной транскрипции. Выполни пользовательскую задачу "
+                "только по фактам из этого фрагмента. Если задача требует общего вывода "
+                "по всей транскрипции, подготовь промежуточные наблюдения для объединения.\n\n"
+                f"Задача:\n{instruction}\n\n"
+                f"Фрагмент {index} из {total_chunks}:\n{chunk}"
+            )
+            partial = generate_chat_text(
+                tokenizer,
+                model,
+                prompt,
+                generation_config,
+                clean_output=False,
+            )
+            partial_results.append(f"[Фрагмент {index}]\n{partial}")
+
+        final_prompt = (
+            "Ниже частичные ответы модели по фрагментам одной транскрипции. "
+            "Собери единый ответ на исходную пользовательскую задачу: убери повторы, "
+            "объедини близкие пункты, сохрани структуру и не добавляй фактов вне частичных ответов.\n\n"
+            f"Исходная задача:\n{instruction}\n\n"
+            "Частичные ответы:\n"
+            + "\n\n".join(partial_results)
+        )
+        return generate_chat_text(
+            tokenizer,
+            model,
+            final_prompt,
+            generation_config,
+            clean_output=False,
+        )
+
+    except Exception as exc:
+        print(f"Text task error: {exc}")
+        return f"Ошибка обработки текста: {exc}"
 
 
 def summarize_text_with_prompt_optimized(
@@ -984,32 +1105,8 @@ def summarize_text_with_prompt_optimized(
             minimum=256,
         )
 
-        from transformers import GenerationConfig
-
         tokenizer, model = load_hf_model(model_name)
-
-        generation_kwargs = {"cache_dir": CACHE_DIR}
-        token = _hf_token()
-        if token:
-            generation_kwargs["token"] = token
-        try:
-            generation_config = GenerationConfig.from_pretrained(
-                model_name,
-                **generation_kwargs,
-            )
-        except Exception:
-            generation_config = model.generation_config
-        generation_config.temperature = TEMPERATURE
-        generation_config.top_p = 0.7
-        generation_config.repetition_penalty = 1.2
-        generation_config.max_new_tokens = NEW_TOKENS
-        generation_config.no_repeat_ngram_size = 6
-        base_tokenizer = _get_tokenizer(tokenizer)
-        generation_config.eos_token_id = base_tokenizer.eos_token_id
-        generation_config.pad_token_id = (
-            base_tokenizer.pad_token_id or base_tokenizer.eos_token_id
-        )
-        generation_config.do_sample = False
+        generation_config = build_generation_config(model_name, model, tokenizer)
 
         chunks = split_text_into_chunks(text, tokenizer, max_tokens=max_chunk_size)
         summaries = []
