@@ -1,7 +1,9 @@
 param(
     [switch]$NoBrowser,
     [switch]$SkipInstall,
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    [switch]$NoInstallPrompt,
+    [string]$InstallDir
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,6 +14,7 @@ $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 $RequirementsPath = Join-Path $Root "requirements.txt"
 $RequirementsStamp = Join-Path $VenvDir ".requirements.sha256"
 $LauncherPath = Join-Path $Root "launcher.py"
+$InstallMarkerPath = Join-Path $Root ".diarization-system-install"
 $PyTorchVersion = if ($env:PYTORCH_VERSION) { $env:PYTORCH_VERSION } else { "2.9.0" }
 $TorchAudioVersion = if ($env:TORCHAUDIO_VERSION) { $env:TORCHAUDIO_VERSION } else { $PyTorchVersion }
 $PyTorchIndexUrl = if ($env:PYTORCH_INDEX_URL) { $env:PYTORCH_INDEX_URL } else { "https://download.pytorch.org/whl/cu128" }
@@ -173,6 +176,144 @@ function Ensure-Shortcut {
     }
 }
 
+function Get-DefaultInstallDir {
+    if ($env:LOCALAPPDATA) {
+        return Join-Path $env:LOCALAPPDATA "DiarizationSystem"
+    }
+    return Join-Path $env:USERPROFILE "DiarizationSystem"
+}
+
+function Select-InstallDir {
+    param([string]$InitialPath)
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dialog.Description = "Выберите папку установки Diarization System"
+        $dialog.SelectedPath = $InitialPath
+        $dialog.ShowNewFolderButton = $true
+        $result = $dialog.ShowDialog()
+        if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+            return $dialog.SelectedPath
+        }
+        return $null
+    } catch {
+        Write-Host "Could not open folder selection dialog: $($_.Exception.Message)"
+        $enteredPath = Read-Host "Enter install folder path or leave empty to cancel"
+        if ([string]::IsNullOrWhiteSpace($enteredPath)) {
+            return $null
+        }
+        return $enteredPath
+    }
+}
+
+function Copy-AppToInstallDir {
+    param([string]$TargetDir)
+
+    $targetFullPath = [System.IO.Path]::GetFullPath($TargetDir)
+    $rootFullPath = [System.IO.Path]::GetFullPath($Root)
+
+    if ($targetFullPath.TrimEnd("\") -ieq $rootFullPath.TrimEnd("\")) {
+        Write-Host "Installing in current folder: $Root"
+        Set-Content -Path $InstallMarkerPath -Value $Root -Encoding UTF8
+        return $false
+    }
+    if ($targetFullPath.StartsWith($rootFullPath.TrimEnd("\") + "\", [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Choose a folder outside the unpacked project folder."
+    }
+
+    Write-Step "Copying application"
+    Write-Host "From: $Root"
+    Write-Host "To:   $targetFullPath"
+
+    New-Item -ItemType Directory -Force -Path $targetFullPath | Out-Null
+    $logPath = Join-Path $env:TEMP "diarization-system-install-copy.log"
+
+    $excludeDirs = @(
+        ".git",
+        ".venv",
+        "venv",
+        "__pycache__",
+        "model_cache",
+        "output_files",
+        "uploads",
+        "browser_capture_chunks",
+        "logs",
+        "build",
+        "dist"
+    )
+    $excludeFiles = @("*.pyc", "*.pyo", "*.log", ".env", ".env.*", ".diarization-system-install")
+
+    $args = @(
+        $Root,
+        $targetFullPath,
+        "/E",
+        "/NFL",
+        "/NDL",
+        "/NJH",
+        "/NJS",
+        "/NP",
+        "/R:2",
+        "/W:2",
+        "/LOG:$logPath",
+        "/XD"
+    ) + $excludeDirs + @("/XF") + $excludeFiles
+
+    & robocopy @args | Out-Null
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -gt 7) {
+        throw "Copy failed with robocopy exit code $exitCode. See $logPath"
+    }
+
+    Set-Content -Path (Join-Path $targetFullPath ".diarization-system-install") -Value $targetFullPath -Encoding UTF8
+    Write-Host "Application copied."
+    return $true
+}
+
+function Invoke-InstalledCopy {
+    param([string]$TargetDir)
+
+    $targetBat = Join-Path $TargetDir "start_windows.bat"
+    if (-not (Test-Path $targetBat)) {
+        throw "Installed launcher was not found: $targetBat"
+    }
+
+    $arguments = @("/c", "`"$targetBat`"", "-NoInstallPrompt")
+    if ($NoBrowser) {
+        $arguments += "-NoBrowser"
+    }
+
+    Write-Host "Starting installed copy..."
+    Start-Process -FilePath "$env:ComSpec" -ArgumentList $arguments -WorkingDirectory $TargetDir
+}
+
+function Ensure-InstallLocation {
+    if ($CheckOnly -or $SkipInstall -or $NoInstallPrompt) {
+        return
+    }
+    if ((Test-Path $VenvPython) -or (Test-Path $InstallMarkerPath)) {
+        return
+    }
+
+    Write-Step "Choose installation folder"
+    $defaultInstallDir = Get-DefaultInstallDir
+    Write-Host "Recommended folder: $defaultInstallDir"
+
+    $selectedInstallDir = $InstallDir
+    if (-not $selectedInstallDir) {
+        $selectedInstallDir = Select-InstallDir -InitialPath $defaultInstallDir
+    }
+    if (-not $selectedInstallDir) {
+        throw "Installation canceled."
+    }
+
+    $copied = Copy-AppToInstallDir -TargetDir $selectedInstallDir
+    if ($copied) {
+        Invoke-InstalledCopy -TargetDir ([System.IO.Path]::GetFullPath($selectedInstallDir))
+        exit 0
+    }
+}
+
 Set-Location $Root
 New-Item -ItemType Directory -Force -Path (Join-Path $Root "logs") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $Root "uploads") | Out-Null
@@ -184,6 +325,7 @@ Write-Step "Diarization System"
 Write-Host "Project folder: $Root"
 
 $python = Ensure-Python
+Ensure-InstallLocation
 
 if ($CheckOnly) {
     Write-Host "Check complete."

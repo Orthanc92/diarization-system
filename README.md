@@ -26,9 +26,17 @@ speaker diarization, summarization, and meeting protocol generation.
 start_windows.bat
 ```
 
-On the first run it will create `.venv`, install dependencies, create a desktop
-shortcut, start the local service, and open the browser. The first dependency
-installation can take a long time because PyTorch and ML packages are large.
+On the first run it will ask where to install the application. The recommended
+folder is:
+
+```text
+%LOCALAPPDATA%\DiarizationSystem
+```
+
+After you choose the folder, the script copies a clean app copy there, creates
+`.venv`, installs dependencies, creates a desktop shortcut, starts the local
+service, and opens the browser. The first dependency installation can take a
+long time because PyTorch and ML packages are large.
 On Windows the startup script installs PyTorch `2.9.0` and torchaudio `2.9.0`
 from the official CUDA 12.8 wheel index:
 
@@ -45,7 +53,13 @@ $env:PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cpu"
 ```
 
 After that, use the desktop shortcut `Diarization System` or double-click
-`start_windows.bat` again.
+`start_windows.bat` in the install folder again.
+
+For portable mode, run from PowerShell:
+
+```powershell
+.\start_windows.bat -NoInstallPrompt
+```
 
 Open manually if needed:
 
