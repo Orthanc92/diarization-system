@@ -28,6 +28,27 @@ Open:
 http://127.0.0.1:3002
 ```
 
+## Windows App Launcher
+
+For a desktop shortcut and a small launcher exe, run once from PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup_windows_app.ps1
+```
+
+The script creates:
+
+- `.venv` with project dependencies
+- `dist\DiarizationSystem.exe`
+- Desktop shortcut `Diarization System`
+
+Double-click the shortcut to start the local service and open the browser.
+Keep the launcher window open while using the service. Press `Ctrl+C` in that
+window to stop it.
+
+This exe is a launcher, not a monolithic bundle with PyTorch and all models
+inside. It expects the project folder and `.venv` to stay next to it.
+
 ## Docker
 
 ```bash

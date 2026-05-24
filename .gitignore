@@ -5,6 +5,8 @@
 /uploads/
 /browser_capture_chunks/
 /logs/
+/build/
+/dist/
 /.idea/
 /.vscode/
 
