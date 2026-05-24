@@ -15,22 +15,41 @@ speaker diarization, summarization, and meeting protocol generation.
 - Recommended summary/protocol model presets by available VRAM
 - Local Hugging Face token storage in `model_cache/hf_token.txt`
 
-## Quick Start
+## Quick Start For Windows
+
+1. Install Python 3.10+ from https://www.python.org/downloads/windows/.
+   Enable `Add python.exe to PATH` during installation.
+2. Download this repository as ZIP and unpack it.
+3. Double-click:
+
+```text
+start_windows.bat
+```
+
+On the first run it will create `.venv`, install dependencies, create a desktop
+shortcut, start the local service, and open the browser. The first dependency
+installation can take a long time because PyTorch and ML packages are large.
+
+After that, use the desktop shortcut `Diarization System` or double-click
+`start_windows.bat` again.
+
+Open manually if needed:
+
+```text
+http://127.0.0.1:3002
+```
+
+## Manual Start
 
 ```bash
 pip install -r requirements.txt
 python main.py
 ```
 
-Open:
-
-```text
-http://127.0.0.1:3002
-```
-
 ## Windows App Launcher
 
-For a desktop shortcut and a small launcher exe, run once from PowerShell:
+The simplest launcher is `start_windows.bat`. If you also want a small exe
+launcher, run once from PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\setup_windows_app.ps1
