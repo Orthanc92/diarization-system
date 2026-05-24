@@ -54,6 +54,23 @@ pyannote-community/speaker-diarization-community-1
 Model cache, uploaded files, browser capture chunks, output files, and tokens are
 ignored by git.
 
+## Logging
+
+Application logs are written to:
+
+```text
+logs/app.log
+```
+
+The log file rotates automatically. You can change logging with environment
+variables:
+
+- `LOG_LEVEL`, default `INFO`
+- `LOG_DIR`, default `logs`
+- `LOG_FILE`, default `logs/app.log`
+- `LOG_MAX_BYTES`, default `10485760`
+- `LOG_BACKUP_COUNT`, default `5`
+
 ## Model Settings
 
 Open `Настройки моделей` in the UI to change:

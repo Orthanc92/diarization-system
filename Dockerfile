@@ -18,13 +18,15 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Create directories for uploads, downloads, browser chunks and model cache
-RUN mkdir -p uploads output_files browser_capture_chunks model_cache
+# Create directories for uploads, downloads, browser chunks, logs and model cache
+RUN mkdir -p uploads output_files browser_capture_chunks logs model_cache
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV GRADIO_SERVER_NAME=0.0.0.0
 ENV GRADIO_SERVER_PORT=3001
+ENV LOG_DIR=/app/logs
+ENV LOG_LEVEL=INFO
 ENV SUMMARY_MODEL_NAME=google/gemma-4-E4B-it
 ENV SUMMARY_MAX_CHUNK_SIZE=4096
 ENV WHISPER_MODEL_NAME=large-v3

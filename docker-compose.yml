@@ -7,9 +7,11 @@ services:
       - ./uploads:/app/uploads
       - ./output_files:/app/output_files
       - ./model_cache:/app/model_cache
+      - ./logs:/app/logs
     environment:
       # Для диаризации можно передать токен здесь или вводить его в UI.
       - HF_TOKEN=${HF_TOKEN:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # Для полностью локального режима укажите путь внутри контейнера,
       # например /app/model_cache/pyannote/speaker-diarization.
       - DIARIZATION_MODEL_NAME=${DIARIZATION_MODEL_NAME:-pyannote-community/speaker-diarization-community-1}

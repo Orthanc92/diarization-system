@@ -11,6 +11,7 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
+from app_logging import LOG_FILE, get_logger, setup_logging
 from model_functions import (
     DEFAULT_PROTOCOL_PROMPT,
     DEFAULT_SUMMARY_PROMPT,
@@ -24,6 +25,9 @@ from model_functions import (
     transcribe_audio_live,
     update_model_settings,
 )
+
+setup_logging()
+logger = get_logger(__name__)
 
 UPLOAD_DIR = Path("uploads")
 OUTPUT_DIR = Path("output_files")
@@ -113,6 +117,7 @@ def _load_saved_hf_token():
             token = ""
     if token:
         os.environ["HF_TOKEN"] = token
+        logger.info("Hugging Face token loaded from environment or local file")
     return token
 
 
@@ -136,6 +141,7 @@ def save_hf_token(token):
 
     os.environ["HF_TOKEN"] = token
     _store_hf_token(token)
+    logger.info("Hugging Face token saved locally: %s", HF_TOKEN_FILE)
     return [
         token,
         gr.update(value=""),
@@ -149,6 +155,7 @@ def clear_hf_token():
         HF_TOKEN_FILE.unlink()
     except FileNotFoundError:
         pass
+    logger.info("Hugging Face token cleared")
     return [
         "",
         gr.update(value=""),
@@ -168,7 +175,8 @@ def _model_settings_markdown(settings=None):
         f"- LLM summary/protocol: `{settings['summary_model_name']}`; "
         f"размер чанка `{settings['summary_max_chunk_size']}` токенов; "
         f"ответ до `{settings['summary_max_new_tokens']}` новых токенов.\n"
-        f"- CUDA: {cuda_status}."
+        f"- CUDA: {cuda_status}.\n"
+        f"- Логи: `{LOG_FILE}`."
     )
 
 
@@ -200,6 +208,7 @@ def save_model_settings_ui(
             "Настройки сохранены. Если модель уже была загружена, она будет перезагружена при следующем запуске задачи.",
         ]
     except Exception as exc:
+        logger.exception("Model settings save failed")
         return [
             _model_settings_markdown(),
             f"Ошибка сохранения настроек: {exc}",
@@ -212,6 +221,7 @@ def create_file_with_uuid(text, directory=OUTPUT_DIR):
 
     file_path = directory / f"{uuid.uuid4()}.txt"
     file_path.write_text(text, encoding="utf-8")
+    logger.info("Output file created: path=%s chars=%s", file_path.resolve(), len(text or ""))
     return str(file_path.resolve())
 
 
@@ -240,6 +250,7 @@ def _append_browser_transcript(session_id, text, status):
     with BROWSER_CAPTURE_LOCK:
         session = BROWSER_CAPTURE_SESSIONS.get(session_id)
         if not session:
+            logger.warning("Browser capture session not found while appending transcript: %s", session_id)
             return
         text = (text or "").strip()
         chunk_number = session["chunks"] + 1
@@ -252,9 +263,17 @@ def _append_browser_transcript(session_id, text, status):
             else:
                 session["transcript"] += text
             session["status"] = status
+            logger.info(
+                "Browser capture segment appended: session=%s chunk=%s mode=%s chars=%s",
+                session_id,
+                chunk_number,
+                mode,
+                len(text),
+            )
         elif text.startswith("Ошибка"):
             session["errors"].append(text)
             session["status"] = text
+            logger.warning("Browser capture segment returned error: session=%s error=%s", session_id, text)
         else:
             session["status"] = (
                 "Сегмент обработан, речь не распознана. "
@@ -280,6 +299,12 @@ def _transcribe_browser_capture_chunk(session_id, chunk_path):
         diarization_model_path = session.get("diarization_model_path")
 
     with BROWSER_CAPTURE_TRANSCRIBE_LOCK:
+        logger.info(
+            "Processing browser capture chunk: session=%s path=%s mode=%s",
+            session_id,
+            chunk_path,
+            mode,
+        )
         text = transcribe_audio(
             audio_path=None,
             video_path=str(chunk_path),
@@ -290,7 +315,9 @@ def _transcribe_browser_capture_chunk(session_id, chunk_path):
         )
     try:
         Path(chunk_path).unlink(missing_ok=True)
+        logger.debug("Browser capture chunk removed: %s", chunk_path)
     except OSError:
+        logger.exception("Could not remove browser capture chunk: %s", chunk_path)
         pass
     _append_browser_transcript(
         session_id,
@@ -310,11 +337,13 @@ def load_browser_capture_text(session_id):
     snapshot = _browser_session_snapshot(session_id)
     text = snapshot["transcript"].strip()
     if not text:
+        logger.info("Browser capture text requested but empty: session=%s", session_id)
         return [
             gr.DownloadButton(visible=False),
             snapshot["status"] or "Текст захвата пока пуст.",
         ]
     path = create_file_with_uuid(text)
+    logger.info("Browser capture text exported: session=%s chars=%s", session_id, len(text))
     return [
         gr.DownloadButton(label="Скачать", value=path, visible=True),
         text,
@@ -711,6 +740,12 @@ def transcribe_and_create_file(
     hf_token=None,
     diarization_model_path=None,
 ):
+    logger.info(
+        "UI transcription started: audio=%s video=%s diarization=%s",
+        bool(audio_path),
+        bool(video_path),
+        bool(enable_diarization),
+    )
     result = transcribe_audio(
         audio_path=audio_path,
         video_path=video_path,
@@ -721,6 +756,7 @@ def transcribe_and_create_file(
         diarization_model_path=diarization_model_path,
     )
     path = create_file_with_uuid(result)
+    logger.info("UI transcription finished: output_chars=%s", len(result or ""))
     return [gr.DownloadButton(label="Скачать", value=path, visible=True), result]
 
 
@@ -754,9 +790,15 @@ def transcribe_video_on_play(
         )
     )
     if live_key == last_live_key:
+        logger.info("Skipped duplicate live video transcription: video=%s", video_path)
         yield [gr.update(), gr.update(), last_live_key]
         return
 
+    logger.info(
+        "Live video transcription started: video=%s diarization=%s",
+        video_path,
+        bool(enable_diarization),
+    )
     final_text = ""
     for partial_text in transcribe_audio_live(
         audio_path=None,
@@ -775,6 +817,7 @@ def transcribe_video_on_play(
         ]
 
     path = create_file_with_uuid(final_text)
+    logger.info("Live video transcription finished: output_chars=%s", len(final_text or ""))
     yield [
         gr.DownloadButton(label="Скачать", value=path, visible=True),
         final_text,
@@ -788,6 +831,11 @@ def process_and_create_file(
     summary_prompt=None,
     protocol_prompt=None,
 ):
+    logger.info(
+        "UI summary/protocol started: input_chars=%s make_protocol=%s",
+        len(text or ""),
+        make_protocol,
+    )
     result = summarize_text_with_prompt_optimized(
         text,
         make_protocol=make_protocol,
@@ -795,12 +843,19 @@ def process_and_create_file(
         protocol_prompt=protocol_prompt,
     )
     path = create_file_with_uuid(result)
+    logger.info("UI summary/protocol finished: output_chars=%s", len(result or ""))
     return [gr.DownloadButton(label="Скачать", value=path, visible=True), result]
 
 
 def process_text_task_and_create_file(text, instruction):
+    logger.info(
+        "UI free-form text task started: input_chars=%s instruction_chars=%s",
+        len(text or ""),
+        len(instruction or ""),
+    )
     result = process_text_with_instruction(text, instruction)
     path = create_file_with_uuid(result)
+    logger.info("UI free-form text task finished: output_chars=%s", len(result or ""))
     return [gr.DownloadButton(label="Скачать", value=path, visible=True), result]
 
 
@@ -1211,6 +1266,14 @@ def create_app(auth=None, server_name="127.0.0.1", server_port=3002):
                 "created_at": now,
                 "updated_at": now,
             }
+        logger.info(
+            "Browser capture session started: session=%s mode=%s min_speakers=%s max_speakers=%s model=%s",
+            session_id,
+            mode,
+            (min_speakers or "").strip(),
+            (max_speakers or "").strip(),
+            (diarization_model_path or "").strip(),
+        )
         return JSONResponse(_browser_session_snapshot(session_id))
 
     @app.post("/api/browser-capture/chunk")
@@ -1220,6 +1283,7 @@ def create_app(auth=None, server_name="127.0.0.1", server_port=3002):
     ):
         session_id = session_id.strip()
         if not session_id:
+            logger.warning("Browser capture chunk rejected: missing session id")
             return JSONResponse(
                 {"status": "Не передан ID сессии.", "transcript": ""},
                 status_code=400,
@@ -1228,6 +1292,7 @@ def create_app(auth=None, server_name="127.0.0.1", server_port=3002):
         with BROWSER_CAPTURE_LOCK:
             session = BROWSER_CAPTURE_SESSIONS.get(session_id)
             if not session:
+                logger.warning("Browser capture chunk rejected: session not found: %s", session_id)
                 return JSONResponse(
                     {"status": "Сессия захвата не найдена.", "transcript": ""},
                     status_code=404,
@@ -1241,7 +1306,14 @@ def create_app(auth=None, server_name="127.0.0.1", server_port=3002):
 
         suffix = Path(file.filename or "audio.webm").suffix or ".webm"
         chunk_path = BROWSER_CAPTURE_DIR / f"{session_id}-{uuid.uuid4()}{suffix}"
-        chunk_path.write_bytes(await file.read())
+        file_content = await file.read()
+        chunk_path.write_bytes(file_content)
+        logger.info(
+            "Browser capture chunk received: session=%s path=%s bytes=%s",
+            session_id,
+            chunk_path,
+            len(file_content),
+        )
         snapshot = await run_in_threadpool(
             _transcribe_browser_capture_chunk,
             session_id,
@@ -1262,6 +1334,9 @@ def create_app(auth=None, server_name="127.0.0.1", server_port=3002):
                 session["running"] = False
                 session["status"] = "Захват остановлен."
                 session["updated_at"] = time.time()
+                logger.info("Browser capture session stopped: session=%s chunks=%s", session_id, session["chunks"])
+            else:
+                logger.warning("Browser capture stop requested for missing session: %s", session_id)
         return JSONResponse(_browser_session_snapshot(session_id))
 
     return gr.mount_gradio_app(
@@ -1283,7 +1358,7 @@ if __name__ == "__main__":
 
     server_name = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
     app = create_app(auth=auth, server_name=server_name, server_port=server_port)
-    print(f"* Running on local URL:  http://{server_name}:{server_port}")
+    logger.info("Running on local URL: http://%s:%s", server_name, server_port)
     uvicorn.run(
         app,
         host=server_name,

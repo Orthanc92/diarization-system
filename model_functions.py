@@ -10,6 +10,10 @@ from pathlib import Path
 
 import torch
 
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+
 # Configuration
 TEMPERATURE = 0.3
 NEW_TOKENS = int(os.getenv("SUMMARY_MAX_NEW_TOKENS", "800"))
@@ -187,7 +191,12 @@ def _load_model_settings_from_disk():
         saved_settings = json.loads(MODEL_SETTINGS_FILE.read_text(encoding="utf-8"))
         if isinstance(saved_settings, dict):
             settings.update(saved_settings)
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
+        logger.info("Model settings file not found, using defaults: %s", MODEL_SETTINGS_FILE)
+    except OSError as exc:
+        logger.warning("Could not read model settings file %s: %s", MODEL_SETTINGS_FILE, exc)
+    except json.JSONDecodeError as exc:
+        logger.warning("Invalid model settings JSON in %s: %s", MODEL_SETTINGS_FILE, exc)
         pass
 
     settings["whisper_model_name"] = (
@@ -226,6 +235,7 @@ def _save_model_settings_to_disk(settings):
         json.dumps(settings, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    logger.info("Model settings saved to %s", MODEL_SETTINGS_FILE)
 
 
 def get_model_settings():
@@ -245,6 +255,8 @@ def get_model_settings():
 
 def unload_whisper_model():
     global whisper_pipeline, whisper_pipeline_key
+    if whisper_pipeline is not None:
+        logger.info("Unloading Whisper model")
     whisper_pipeline = None
     whisper_pipeline_key = None
     gc.collect()
@@ -254,6 +266,8 @@ def unload_whisper_model():
 
 def unload_hf_model():
     global hf_tokenizer, hf_model, hf_model_name
+    if hf_model is not None or hf_tokenizer is not None:
+        logger.info("Unloading LLM model: %s", hf_model_name)
     hf_tokenizer = None
     hf_model = None
     hf_model_name = None
@@ -325,6 +339,16 @@ def update_model_settings(
 
     MODEL_SETTINGS = new_settings
     _save_model_settings_to_disk(new_settings)
+    logger.info(
+        "Model settings updated: whisper=%s device=%s compute=%s batch=%s llm=%s chunk=%s max_new_tokens=%s",
+        new_settings["whisper_model_name"],
+        new_settings["whisper_device"],
+        new_settings["whisper_compute_type"],
+        new_settings["whisper_batch_size"],
+        new_settings["summary_model_name"],
+        new_settings["summary_max_chunk_size"],
+        new_settings["summary_max_new_tokens"],
+    )
 
     if any(old_settings[key] != new_settings[key] for key in whisper_keys):
         unload_whisper_model()
@@ -413,6 +437,7 @@ def extract_audio_from_video(video_path):
     if not video_path:
         raise ValueError("Не передан видеофайл.")
 
+    logger.info("Extracting audio with ffmpeg: source=%s", video_path)
     fd, temp_filename = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
 
@@ -442,8 +467,10 @@ def extract_audio_from_video(video_path):
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
         stderr = result.stderr.strip()[-2000:]
+        logger.error("ffmpeg audio extraction failed: source=%s stderr=%s", video_path, stderr)
         raise RuntimeError(f"Не удалось извлечь аудиодорожку из видео через ffmpeg: {stderr}")
 
+    logger.info("Audio extracted: source=%s output=%s", video_path, temp_filename)
     return temp_filename
 
 
@@ -478,6 +505,7 @@ def load_whisper_pipeline():
     )
 
     if whisper_pipeline is not None and whisper_pipeline_key == pipeline_key:
+        logger.debug("Reusing Whisper pipeline: %s", pipeline_key)
         return whisper_pipeline
     if whisper_pipeline is not None:
         unload_whisper_model()
@@ -499,9 +527,18 @@ def load_whisper_pipeline():
     if resolved_device == "cuda":
         model_kwargs["device_index"] = 0
 
+    logger.info(
+        "Loading Whisper model: model=%s device=%s compute=%s cpu_threads=%s workers=%s",
+        settings["whisper_model_name"],
+        resolved_device,
+        compute_type,
+        settings["whisper_cpu_threads"],
+        settings["whisper_num_workers"],
+    )
     model = WhisperModel(settings["whisper_model_name"], **model_kwargs)
     whisper_pipeline = BatchedInferencePipeline(model=model)
     whisper_pipeline_key = pipeline_key
+    logger.info("Whisper model loaded: %s", pipeline_key)
     return whisper_pipeline
 
 
@@ -510,6 +547,7 @@ def unload_transcription_models():
     if whisper_pipeline is None and diarization_pipeline is None:
         return
 
+    logger.info("Unloading transcription models")
     whisper_pipeline = None
     whisper_pipeline_key = None
     diarization_pipeline = None
@@ -526,6 +564,11 @@ def transcribe_segments(audio_path):
 def iter_transcribe_segments(audio_path):
     pipeline = load_whisper_pipeline()
     settings = get_model_settings()
+    logger.info(
+        "Starting Whisper transcription: audio=%s batch=%s",
+        audio_path,
+        settings["whisper_batch_size"],
+    )
     segments, _info = pipeline.transcribe(
         audio_path,
         language="ru",
@@ -546,6 +589,7 @@ def _load_pyannote_pipeline(pipeline_cls, model_origin, token=None):
         kwargs["token"] = token
 
     try:
+        logger.info("Loading pyannote pipeline: model=%s local=%s", model_origin, _looks_like_local_path(model_origin))
         return pipeline_cls.from_pretrained(model_origin, **kwargs)
     except TypeError:
         kwargs.pop("token", None)
@@ -579,6 +623,7 @@ def load_diarization_pipeline(hf_token=None, model_name=None):
     model_origin, local_model = _resolve_local_model_origin(model_name)
 
     if diarization_pipeline is not None and diarization_pipeline_name == model_origin:
+        logger.debug("Reusing diarization pipeline: %s", model_origin)
         return diarization_pipeline
 
     if _looks_like_local_path(model_origin) and not local_model:
@@ -609,6 +654,7 @@ def load_diarization_pipeline(hf_token=None, model_name=None):
     diarization_pipeline_name = model_origin
     if torch.cuda.is_available():
         diarization_pipeline.to(torch.device("cuda"))
+    logger.info("Diarization pipeline loaded: model=%s cuda=%s", model_origin, torch.cuda.is_available())
     return diarization_pipeline
 
 
@@ -619,6 +665,13 @@ def diarize_audio(
     hf_token=None,
     diarization_model_path=None,
 ):
+    logger.info(
+        "Running diarization: audio=%s min_speakers=%s max_speakers=%s model=%s",
+        audio_path,
+        min_speakers,
+        max_speakers,
+        diarization_model_path or DIARIZATION_MODEL_NAME,
+    )
     pipeline = load_diarization_pipeline(
         hf_token=hf_token,
         model_name=diarization_model_path,
@@ -641,7 +694,9 @@ def diarize_audio(
         diarization_kwargs["min_speakers"] = min_speakers
     if max_speakers:
         diarization_kwargs["max_speakers"] = max_speakers
-    return pipeline(audio_input, **diarization_kwargs)
+    result = pipeline(audio_input, **diarization_kwargs)
+    logger.info("Diarization completed: audio=%s", audio_path)
+    return result
 
 
 def _diarization_annotation(diarization):
@@ -710,15 +765,24 @@ def transcribe_audio(
     """Transcribe uploaded audio or a video's audio track, optionally with speaker diarization."""
     temp_audio_path = None
     try:
+        logger.info(
+            "Transcription requested: audio=%s video=%s diarization=%s",
+            bool(audio_path),
+            bool(video_path),
+            bool(enable_diarization),
+        )
         source_audio_path, temp_audio_path = get_audio_source(
             audio_path,
             video_path,
             force_wav=enable_diarization,
         )
         segments = transcribe_segments(source_audio_path)
+        logger.info("Transcription segments completed: count=%s source=%s", len(segments), source_audio_path)
 
         if not enable_diarization:
-            return format_plain_transcript(segments)
+            transcript = format_plain_transcript(segments)
+            logger.info("Plain transcription completed: chars=%s", len(transcript))
+            return transcript
 
         try:
             diarization = diarize_audio(
@@ -729,17 +793,25 @@ def transcribe_audio(
                 diarization_model_path=diarization_model_path,
             )
             turns = diarization_turns(diarization)
-            return format_diarized_transcript(segments, turns)
+            transcript = format_diarized_transcript(segments, turns)
+            logger.info(
+                "Diarized transcription completed: chars=%s turns=%s",
+                len(transcript),
+                len(turns),
+            )
+            return transcript
         except Exception as exc:
+            logger.exception("Diarization failed after transcription")
             transcript = format_plain_transcript(segments)
             return f"{transcript}\n\n[Диаризация не выполнена: {exc}]"
 
     except Exception as exc:
-        print(f"Transcription error: {exc}")
+        logger.exception("Transcription failed")
         return f"Ошибка транскрибации: {exc}"
     finally:
         if temp_audio_path and os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
+            logger.debug("Temporary audio removed: %s", temp_audio_path)
 
 
 def transcribe_audio_live(
@@ -757,6 +829,12 @@ def transcribe_audio_live(
     final_text = ""
 
     try:
+        logger.info(
+            "Live transcription requested: audio=%s video=%s diarization=%s",
+            bool(audio_path),
+            bool(video_path),
+            bool(enable_diarization),
+        )
         yield "Подготовка аудио..."
         source_audio_path, temp_audio_path = get_audio_source(
             audio_path,
@@ -778,10 +856,16 @@ def transcribe_audio_live(
             segment_end = float(segment.end or 0)
             if segment_end - last_yield_end >= LIVE_TRANSCRIPTION_UPDATE_SECONDS:
                 final_text = format_plain_transcript(segments)
+                logger.debug(
+                    "Live transcription partial: segments=%s chars=%s",
+                    len(segments),
+                    len(final_text),
+                )
                 yield final_text
                 last_yield_end = segment_end
 
         final_text = format_plain_transcript(segments)
+        logger.info("Live transcription completed: segments=%s chars=%s", len(segments), len(final_text))
         if not enable_diarization:
             yield final_text
             return
@@ -796,16 +880,24 @@ def transcribe_audio_live(
                 diarization_model_path=diarization_model_path,
             )
             turns = diarization_turns(diarization)
-            yield format_diarized_transcript(segments, turns)
+            diarized_text = format_diarized_transcript(segments, turns)
+            logger.info(
+                "Live diarized transcription completed: chars=%s turns=%s",
+                len(diarized_text),
+                len(turns),
+            )
+            yield diarized_text
         except Exception as exc:
+            logger.exception("Live diarization failed after transcription")
             yield f"{final_text}\n\n[Диаризация не выполнена: {exc}]"
 
     except Exception as exc:
-        print(f"Live transcription error: {exc}")
+        logger.exception("Live transcription failed")
         yield f"Ошибка потоковой транскрибации: {exc}"
     finally:
         if temp_audio_path and os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
+            logger.debug("Temporary audio removed: %s", temp_audio_path)
 
 
 def load_hf_model(model_name=None):
@@ -814,6 +906,7 @@ def load_hf_model(model_name=None):
 
     model_name = (model_name or get_model_settings()["summary_model_name"]).strip()
     if hf_tokenizer is not None and hf_model is not None and hf_model_name == model_name:
+        logger.debug("Reusing LLM model: %s", model_name)
         return hf_tokenizer, hf_model
 
     unload_transcription_models()
@@ -827,8 +920,10 @@ def load_hf_model(model_name=None):
         common_kwargs["token"] = token
 
     try:
+        logger.info("Loading LLM tokenizer: %s", model_name)
         processor = AutoTokenizer.from_pretrained(model_name, **common_kwargs)
     except Exception as exc:
+        logger.exception("LLM tokenizer loading failed: %s", model_name)
         raise RuntimeError(
             f"Не удалось загрузить токенизатор для {model_name}. "
             "Для Gemma 4 нужен transformers>=5.9.0 и huggingface-hub>=1.5.0; "
@@ -843,9 +938,16 @@ def load_hf_model(model_name=None):
     if torch.cuda.is_available():
         model_kwargs["attn_implementation"] = "sdpa"
 
+    logger.info(
+        "Loading LLM model: model=%s cuda=%s dtype=%s",
+        model_name,
+        torch.cuda.is_available(),
+        model_kwargs["torch_dtype"],
+    )
     hf_model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
     hf_tokenizer = processor
     hf_model_name = model_name
+    logger.info("LLM model loaded: %s", model_name)
     return hf_tokenizer, hf_model
 
 
@@ -990,6 +1092,12 @@ def build_generation_config(model_name, model, processor, max_new_tokens=NEW_TOK
         base_tokenizer.pad_token_id or base_tokenizer.eos_token_id
     )
     generation_config.do_sample = False
+    logger.debug(
+        "Generation config prepared: model=%s max_new_tokens=%s temperature=%s",
+        model_name,
+        max_new_tokens,
+        TEMPERATURE,
+    )
     return generation_config
 
 
@@ -1032,6 +1140,11 @@ def process_text_with_instruction(
         if not instruction or not instruction.strip():
             return "Опишите, что нужно сделать с текстом."
 
+        logger.info(
+            "Free-form text task requested: input_chars=%s instruction_chars=%s",
+            len(text),
+            len(instruction),
+        )
         text = prepare_text_for_summary(text)
         instruction = instruction.strip()
         settings = get_model_settings()
@@ -1055,15 +1168,24 @@ def process_text_with_instruction(
             max_new_tokens=max_new_tokens,
         )
         chunks = split_text_into_chunks(text, tokenizer, max_tokens=max_chunk_size)
+        logger.info(
+            "Free-form text task chunks prepared: chunks=%s max_chunk_size=%s max_new_tokens=%s model=%s",
+            len(chunks),
+            max_chunk_size,
+            max_new_tokens,
+            model_name,
+        )
 
         if len(chunks) == 1:
-            return generate_chat_text(
+            result = generate_chat_text(
                 tokenizer,
                 model,
                 render_text_task_prompt(instruction, chunks[0]),
                 generation_config,
                 clean_output=False,
             )
+            logger.info("Free-form text task completed: output_chars=%s", len(result))
+            return result
 
         partial_results = []
         total_chunks = len(chunks)
@@ -1092,16 +1214,18 @@ def process_text_with_instruction(
             "Частичные ответы:\n"
             + "\n\n".join(partial_results)
         )
-        return generate_chat_text(
+        result = generate_chat_text(
             tokenizer,
             model,
             final_prompt,
             generation_config,
             clean_output=False,
         )
+        logger.info("Free-form text task completed: output_chars=%s partials=%s", len(result), len(partial_results))
+        return result
 
     except Exception as exc:
-        print(f"Text task error: {exc}")
+        logger.exception("Free-form text task failed")
         return f"Ошибка обработки текста: {exc}"
 
 
@@ -1122,6 +1246,7 @@ def summarize_text_with_prompt_optimized(
         if not text or not text.strip():
             return "Передайте текст для суммаризации."
 
+        logger.info("Summarization requested: input_chars=%s make_protocol=%s", len(text), make_protocol)
         text = prepare_text_for_summary(text)
         settings = get_model_settings()
         model_name = (model_name or settings["summary_model_name"]).strip()
@@ -1145,6 +1270,13 @@ def summarize_text_with_prompt_optimized(
         )
 
         chunks = split_text_into_chunks(text, tokenizer, max_tokens=max_chunk_size)
+        logger.info(
+            "Summarization chunks prepared: chunks=%s max_chunk_size=%s max_new_tokens=%s model=%s",
+            len(chunks),
+            max_chunk_size,
+            max_new_tokens,
+            model_name,
+        )
         summaries = []
 
         prompt_template = (
@@ -1168,12 +1300,14 @@ def summarize_text_with_prompt_optimized(
                 DEFAULT_SUMMARY_PROMPT,
                 combined_summary,
             )
-            return generate_chat_text(
+            result = generate_chat_text(
                 tokenizer,
                 model,
                 final_summary_prompt,
                 generation_config,
             )
+            logger.info("Summary completed: output_chars=%s chunk_summaries=%s", len(result), len(summaries))
+            return result
 
         final_prompt = render_user_prompt(
             protocol_prompt,
@@ -1193,11 +1327,12 @@ def summarize_text_with_prompt_optimized(
                 final_summary = final_summary[len(final_prompt) :].strip()
 
         except Exception as exc:
-            print(f"Ошибка при финальной суммаризации (протокол): {exc}")
+            logger.exception("Final protocol generation failed, returning combined summary")
             final_summary = combined_summary
 
+        logger.info("Protocol completed: output_chars=%s chunk_summaries=%s", len(final_summary), len(summaries))
         return final_summary
 
     except Exception as exc:
-        print(f"Summarization error: {exc}")
+        logger.exception("Summarization failed")
         return f"Ошибка суммаризации: {exc}"
