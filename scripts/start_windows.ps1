@@ -12,6 +12,9 @@ $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 $RequirementsPath = Join-Path $Root "requirements.txt"
 $RequirementsStamp = Join-Path $VenvDir ".requirements.sha256"
 $LauncherPath = Join-Path $Root "launcher.py"
+$PyTorchVersion = if ($env:PYTORCH_VERSION) { $env:PYTORCH_VERSION } else { "2.9.0" }
+$TorchAudioVersion = if ($env:TORCHAUDIO_VERSION) { $env:TORCHAUDIO_VERSION } else { $PyTorchVersion }
+$PyTorchIndexUrl = if ($env:PYTORCH_INDEX_URL) { $env:PYTORCH_INDEX_URL } else { "https://download.pytorch.org/whl/cu128" }
 
 function Write-Step {
     param([string]$Message)
@@ -120,25 +123,46 @@ function Ensure-Dependencies {
     }
 
     $requirementsHash = (Get-FileHash $RequirementsPath -Algorithm SHA256).Hash
+    $installStamp = "requirements=$requirementsHash`ntorch=$PyTorchVersion`ntorchaudio=$TorchAudioVersion`nindex=$PyTorchIndexUrl"
     $installedHash = ""
     if (Test-Path $RequirementsStamp) {
         $installedHash = (Get-Content $RequirementsStamp -Raw).Trim()
     }
 
-    if ($requirementsHash -eq $installedHash) {
+    if ($installStamp -eq $installedHash) {
         Write-Host "Dependencies are already installed for current requirements.txt."
         return
     }
 
     Write-Step "Installing dependencies"
     Write-Host "This can take a long time on the first run."
+    Write-Host "Installing PyTorch $PyTorchVersion / torchaudio $TorchAudioVersion from $PyTorchIndexUrl"
     & $VenvPython -m pip install --upgrade pip
-    & $VenvPython -m pip install -r $RequirementsPath
+
+    & $VenvPython -m pip install `
+        "torch==$PyTorchVersion" `
+        "torchaudio==$TorchAudioVersion" `
+        --index-url $PyTorchIndexUrl
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyTorch installation failed."
+    }
+
+    $filteredRequirements = Join-Path $env:TEMP "diarization-system-requirements-no-torch.txt"
+    Get-Content $RequirementsPath |
+        Where-Object { $_ -notmatch "^\s*(torch|torchaudio|torchvision)\b" } |
+        Set-Content -Path $filteredRequirements -Encoding UTF8
+
+    & $VenvPython -m pip install -r $filteredRequirements
     if ($LASTEXITCODE -ne 0) {
         throw "Dependency installation failed."
     }
 
-    Set-Content -Path $RequirementsStamp -Value $requirementsHash -Encoding ASCII
+    & $VenvPython -c "import torch; print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available(), 'cuda', torch.version.cuda)"
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyTorch verification failed."
+    }
+
+    Set-Content -Path $RequirementsStamp -Value $installStamp -Encoding ASCII
 }
 
 function Ensure-Shortcut {

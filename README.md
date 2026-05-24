@@ -29,6 +29,20 @@ start_windows.bat
 On the first run it will create `.venv`, install dependencies, create a desktop
 shortcut, start the local service, and open the browser. The first dependency
 installation can take a long time because PyTorch and ML packages are large.
+On Windows the startup script installs PyTorch `2.9.0` and torchaudio `2.9.0`
+from the official CUDA 12.8 wheel index:
+
+```text
+https://download.pytorch.org/whl/cu128
+```
+
+To use another PyTorch wheel index, set `PYTORCH_INDEX_URL` before launch. For
+CPU-only installation, use:
+
+```powershell
+$env:PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cpu"
+.\start_windows.bat
+```
 
 After that, use the desktop shortcut `Diarization System` or double-click
 `start_windows.bat` again.
@@ -44,6 +58,14 @@ http://127.0.0.1:3002
 ```bash
 pip install -r requirements.txt
 python main.py
+```
+
+For CUDA on manual Windows installs, install PyTorch from the official CUDA wheel
+index first:
+
+```powershell
+pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements.txt
 ```
 
 ## Windows App Launcher

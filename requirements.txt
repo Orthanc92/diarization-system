@@ -1,7 +1,7 @@
 gradio>=6.14.0,<7.0.0
 websockets>=13.1,<15
 accelerate>=0.26.0
-torch
+torch==2.9.0
 torchaudio==2.9.0
 faster-whisper>=1.0.0,<2.0.0
 transformers>=5.9.0,<6.0.0
