@@ -36,6 +36,8 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 BROWSER_CAPTURE_DIR.mkdir(exist_ok=True)
 BROWSER_CAPTURE_SEGMENT_MS = int(os.getenv("BROWSER_CAPTURE_SEGMENT_MS", "60000"))
+BROWSER_CAPTURE_MIN_SEGMENT_MS = 5000
+BROWSER_CAPTURE_MAX_SEGMENT_MS = 10 * 60 * 1000
 
 BROWSER_CAPTURE_SESSIONS = {}
 BROWSER_CAPTURE_LOCK = threading.Lock()
@@ -235,6 +237,7 @@ def _browser_session_snapshot(session_id):
                 "transcript": "",
                 "chunks": 0,
                 "running": False,
+                "segment_ms": BROWSER_CAPTURE_SEGMENT_MS,
             }
         return {
             "session_id": session_id,
@@ -243,6 +246,7 @@ def _browser_session_snapshot(session_id):
             "chunks": session["chunks"],
             "running": session["running"],
             "mode": session.get("mode", BROWSER_CAPTURE_MODE_TRANSCRIPTION),
+            "segment_ms": session.get("segment_ms", BROWSER_CAPTURE_SEGMENT_MS),
         }
 
 
@@ -288,6 +292,19 @@ def _normalize_browser_capture_mode(mode):
     if mode == BROWSER_CAPTURE_MODE_DIARIZATION:
         return BROWSER_CAPTURE_MODE_DIARIZATION
     return BROWSER_CAPTURE_MODE_TRANSCRIPTION
+
+
+def _normalize_browser_capture_segment_ms(segment_seconds):
+    try:
+        segment_seconds = float(segment_seconds)
+    except (TypeError, ValueError):
+        return BROWSER_CAPTURE_SEGMENT_MS
+
+    segment_ms = int(segment_seconds * 1000)
+    return max(
+        BROWSER_CAPTURE_MIN_SEGMENT_MS,
+        min(BROWSER_CAPTURE_MAX_SEGMENT_MS, segment_ms),
+    )
 
 
 def _transcribe_browser_capture_chunk(session_id, chunk_path):
@@ -375,7 +392,7 @@ def _browser_capture_widget_html():
     .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
     .settings {
       display: grid;
-      grid-template-columns: minmax(180px, 1fr) 110px 110px minmax(220px, 2fr);
+      grid-template-columns: minmax(180px, 1fr) minmax(130px, 150px) 110px 110px minmax(220px, 2fr);
       gap: 8px;
       margin-bottom: 10px;
       align-items: end;
@@ -442,6 +459,17 @@ def _browser_capture_widget_html():
           <option value="diarization">Диаризация по спикерам</option>
         </select>
       </label>
+      <label>
+        Длина сегмента
+        <select id="segmentSeconds">
+          <option value="15">15 сек</option>
+          <option value="30">30 сек</option>
+          <option value="60">1 мин</option>
+          <option value="120">2 мин</option>
+          <option value="180">3 мин</option>
+          <option value="300">5 мин</option>
+        </select>
+      </label>
       <label class="diarization-setting">
         Мин. спикеров
         <input id="minSpeakers" type="number" min="1" step="1" placeholder="auto" />
@@ -485,6 +513,7 @@ def _browser_capture_widget_html():
     const minSpeakersEl = document.getElementById("minSpeakers");
     const maxSpeakersEl = document.getElementById("maxSpeakers");
     const diarizationModelPathEl = document.getElementById("diarizationModelPath");
+    const segmentSecondsEl = document.getElementById("segmentSeconds");
     const diarizationSettingEls = Array.from(document.querySelectorAll(".diarization-setting"));
 
     function setStatus(text) {
@@ -523,8 +552,20 @@ def _browser_capture_widget_html():
     }
 
     function setSettingsDisabled(disabled) {
-      [processingModeEl, minSpeakersEl, maxSpeakersEl, diarizationModelPathEl]
+      [processingModeEl, segmentSecondsEl, minSpeakersEl, maxSpeakersEl, diarizationModelPathEl]
         .forEach((elem) => { elem.disabled = disabled; });
+    }
+
+    function applyDefaultSegmentDuration() {
+      const defaultSeconds = Math.max(5, Math.round(state.segmentMs / 1000));
+      const value = String(defaultSeconds);
+      if (!Array.from(segmentSecondsEl.options).some((option) => option.value === value)) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = `${defaultSeconds} сек`;
+        segmentSecondsEl.appendChild(option);
+      }
+      segmentSecondsEl.value = value;
     }
 
     function toggleDiarizationSettings() {
@@ -553,6 +594,7 @@ def _browser_capture_widget_html():
       form.append("min_speakers", minSpeakersEl.value || "");
       form.append("max_speakers", maxSpeakersEl.value || "");
       form.append("diarization_model_path", diarizationModelPathEl.value || "");
+      form.append("segment_seconds", segmentSecondsEl.value || "");
       const response = await fetch("/api/browser-capture/start", {
         method: "POST",
         body: form,
@@ -560,6 +602,8 @@ def _browser_capture_widget_html():
       if (!response.ok) throw new Error("Не удалось создать сессию захвата.");
       const data = await response.json();
       syncSessionId(data.session_id);
+      state.segmentMs = data.segment_ms || state.segmentMs;
+      applyDefaultSegmentDuration();
       syncTranscript("");
       setStatus(data.status || "Захват запущен.");
     }
@@ -659,8 +703,8 @@ def _browser_capture_widget_html():
         stopBtn.disabled = false;
         setStatus(
           processingModeEl.value === "diarization"
-            ? "Захват идет. Диаризация обновляется сегментами."
-            : "Захват идет. Транскрипция обновляется сегментами."
+            ? `Захват идет. Диаризация обновляется сегментами по ${Math.round(state.segmentMs / 1000)} сек.`
+            : `Захват идет. Транскрипция обновляется сегментами по ${Math.round(state.segmentMs / 1000)} сек.`
         );
         state.pollTimer = window.setInterval(pollStatus, 2000);
         recordNextSegment();
@@ -715,6 +759,7 @@ def _browser_capture_widget_html():
     startBtn.addEventListener("click", startCapture);
     stopBtn.addEventListener("click", stopCapture);
     processingModeEl.addEventListener("change", toggleDiarizationSettings);
+    applyDefaultSegmentDuration();
     toggleDiarizationSettings();
     copyBtn.addEventListener("click", async () => {
       try {
@@ -1243,14 +1288,16 @@ def create_app(auth=None, server_name="127.0.0.1", server_port=3002):
         min_speakers: str = Form(""),
         max_speakers: str = Form(""),
         diarization_model_path: str = Form(""),
+        segment_seconds: str = Form(""),
     ):
         session_id = str(uuid.uuid4())
         now = time.time()
         mode = _normalize_browser_capture_mode(mode)
+        segment_ms = _normalize_browser_capture_segment_ms(segment_seconds)
         status = (
-            "Сессия захвата с диаризацией создана."
+            f"Сессия захвата с диаризацией создана. Длина сегмента: {segment_ms // 1000} сек."
             if mode == BROWSER_CAPTURE_MODE_DIARIZATION
-            else "Сессия захвата создана."
+            else f"Сессия захвата создана. Длина сегмента: {segment_ms // 1000} сек."
         )
         with BROWSER_CAPTURE_LOCK:
             BROWSER_CAPTURE_SESSIONS[session_id] = {
@@ -1263,13 +1310,15 @@ def create_app(auth=None, server_name="127.0.0.1", server_port=3002):
                 "min_speakers": (min_speakers or "").strip(),
                 "max_speakers": (max_speakers or "").strip(),
                 "diarization_model_path": (diarization_model_path or "").strip(),
+                "segment_ms": segment_ms,
                 "created_at": now,
                 "updated_at": now,
             }
         logger.info(
-            "Browser capture session started: session=%s mode=%s min_speakers=%s max_speakers=%s model=%s",
+            "Browser capture session started: session=%s mode=%s segment_ms=%s min_speakers=%s max_speakers=%s model=%s",
             session_id,
             mode,
+            segment_ms,
             (min_speakers or "").strip(),
             (max_speakers or "").strip(),
             (diarization_model_path or "").strip(),

@@ -8,6 +8,7 @@ speaker diarization, summarization, and meeting protocol generation.
 - Audio and video transcription with `faster-whisper`
 - Speaker diarization with `pyannote.audio`
 - Browser tab/window audio capture for videos that cannot be downloaded
+- Configurable browser audio segment duration for transcription/diarization
 - Summaries and protocols with a local Hugging Face LLM
 - Free-form text/transcript analysis with custom user instructions
 - Editable prompts for summaries and protocols in the UI
