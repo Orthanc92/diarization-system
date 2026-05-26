@@ -56,7 +56,7 @@ RECOMMENDED_SUMMARY_MODELS = [
         "name": "Qwen3 32B AWQ",
         "model_id": "Qwen/Qwen3-32B-AWQ",
         "vram": "24 GB / AWQ 4-bit",
-        "note": "лучшее качество для RTX 4090; работает через transformers и vLLM, требует autoawq",
+        "note": "лучшее качество для RTX 4090; работает через transformers и vLLM, требует gptqmodel и Triton",
     },
     {
         "name": "Qwen3 1.7B",
@@ -1134,6 +1134,12 @@ def load_hf_model(model_name=None):
             "Для текущей версии transformers нужен пакет gptqmodel: "
             "pip install gptqmodel"
         )
+    if is_awq_model and not _package_available("triton"):
+        raise RuntimeError(
+            f"Модель {model_name} использует AWQ-квантизацию. "
+            "Для текущей версии transformers нужен Triton. "
+            "На Windows установите: pip install triton-windows"
+        )
 
     try:
         logger.info("Loading LLM tokenizer: %s", model_name)
@@ -1174,7 +1180,7 @@ def load_hf_model(model_name=None):
         if is_awq_model:
             raise RuntimeError(
                 f"Не удалось загрузить AWQ-модель {model_name}. "
-                "Проверьте, что установлен gptqmodel, а на GPU достаточно памяти. "
+                "Проверьте, что установлены gptqmodel и Triton, а на GPU достаточно памяти. "
                 "Для RTX 4090 закройте другие модели или временно переключите Whisper на CPU. "
                 f"Детали: {exc}"
             ) from exc
