@@ -151,11 +151,12 @@ The first launch downloads model files into:
 model_cache/huggingface
 ```
 
-Docker defaults to `Qwen/Qwen3-32B-AWQ` through vLLM and keeps Whisper on CPU so
+Docker defaults to `Qwen/Qwen3-14B-AWQ` through vLLM and keeps Whisper on CPU so
 the LLM can use GPU memory. To change ports, model, Hugging Face token, or move
 Whisper to GPU, edit `docker.env`. If port `3002` is already occupied, change
 `APP_PORT`. For RTX 4090 the default `VLLM_MAX_MODEL_LEN=8192` is intentionally
-conservative; increase it only if vLLM starts without VRAM errors.
+conservative. `Qwen/Qwen3-32B-AWQ` is heavier and can fail on 24 GB GPUs because
+there is not enough memory left for vLLM KV-cache.
 
 Stop the stack:
 
@@ -225,7 +226,7 @@ the UI setting `Backend LLM` to `vLLM OpenAI API`.
 Example external vLLM server:
 
 ```bash
-vllm serve --model Qwen/Qwen3-32B-AWQ --served-model-name Qwen/Qwen3-32B-AWQ --host 0.0.0.0 --port 8000 --trust-remote-code --quantization awq
+vllm serve --model Qwen/Qwen3-14B-AWQ --served-model-name Qwen/Qwen3-14B-AWQ --host 0.0.0.0 --port 8000 --trust-remote-code --quantization awq
 ```
 
 Then set in `Настройки моделей`:
@@ -233,7 +234,7 @@ Then set in `Настройки моделей`:
 ```text
 Backend LLM: vLLM OpenAI API
 vLLM base URL: http://127.0.0.1:8000/v1
-vLLM model: Qwen/Qwen3-32B-AWQ
+vLLM model: Qwen/Qwen3-14B-AWQ
 ```
 
 If your external vLLM server requires an API key, set it before launch:
