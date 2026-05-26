@@ -1,38 +1,45 @@
 FROM pytorch/pytorch:2.9.0-cuda12.8-cudnn9-runtime
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    python3-pip \
-    python3-dev \
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    git \
     libsndfile1 \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python packages
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Copy application code
+RUN python -m pip install --upgrade pip && \
+    python -m pip install --no-cache-dir torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128 && \
+    grep -Ev '^(torch|torchaudio)==?' requirements.txt > /tmp/requirements-docker.txt && \
+    python -m pip install --no-cache-dir -r /tmp/requirements-docker.txt
+
 COPY . .
 
-# Create directories for uploads, downloads, browser chunks, logs and model cache
 RUN mkdir -p uploads output_files browser_capture_chunks logs model_cache
 
-# Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV GRADIO_SERVER_NAME=0.0.0.0
-ENV GRADIO_SERVER_PORT=3001
+ENV GRADIO_SERVER_PORT=3002
 ENV LOG_DIR=/app/logs
 ENV LOG_LEVEL=INFO
-ENV SUMMARY_MODEL_NAME=google/gemma-4-E4B-it
+ENV HF_HOME=/app/model_cache/huggingface
+ENV HF_HUB_CACHE=/app/model_cache/huggingface/hub
+ENV MODEL_SETTINGS_FILE=/app/model_cache/docker_model_settings.json
+ENV SUMMARY_MODEL_NAME=Qwen/Qwen3-32B-AWQ
 ENV SUMMARY_MAX_CHUNK_SIZE=4096
+ENV SUMMARY_MAX_NEW_TOKENS=2500
+ENV LLM_BACKEND=vllm
+ENV VLLM_BASE_URL=http://vllm:8000/v1
+ENV VLLM_MODEL_NAME=Qwen/Qwen3-32B-AWQ
 ENV WHISPER_MODEL_NAME=large-v3
-ENV WHISPER_DEVICE=auto
+ENV WHISPER_DEVICE=cpu
 ENV WHISPER_COMPUTE_TYPE=auto
-ENV WHISPER_BATCH_SIZE=32
+ENV WHISPER_BATCH_SIZE=8
 ENV WHISPER_CPU_THREADS=12
 ENV WHISPER_NUM_WORKERS=6
 ENV LIVE_TRANSCRIPTION_UPDATE_SECONDS=5
@@ -40,8 +47,7 @@ ENV BROWSER_CAPTURE_SEGMENT_MS=60000
 ENV DIARIZATION_MODEL_NAME=pyannote-community/speaker-diarization-community-1
 ENV PYANNOTE_METRICS_ENABLED=0
 ENV HF_HUB_OFFLINE=0
-ENV HF_HOME=/app/model_cache
-ENV HF_HUB_CACHE=/app/model_cache/hub
 
-# Run the application
-CMD ["python3", "main.py"] 
+EXPOSE 3002
+
+CMD ["python", "main.py"]

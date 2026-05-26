@@ -106,16 +106,61 @@ window to stop it.
 This exe is a launcher, not a monolithic bundle with PyTorch and all models
 inside. It expects the project folder and `.venv` to stay next to it.
 
-## Docker
+## Docker + vLLM
 
-```bash
-docker compose up --build
+Docker is the recommended path when you want faster LLM generation. The Compose
+stack starts two containers:
+
+- `vllm` - OpenAI-compatible vLLM server for summaries, protocols, and free-form text tasks
+- `app` - Gradio application with Whisper, diarization, browser capture, and UI
+
+Requirements:
+
+- Docker Desktop with WSL2 backend
+- NVIDIA driver and GPU support enabled in Docker Desktop
+- Enough free VRAM for the selected vLLM model
+
+Start on Windows:
+
+```text
+start_docker.bat
+```
+
+Or manually:
+
+```powershell
+copy docker.env.example docker.env
+docker compose --env-file docker.env up --build
 ```
 
 Open:
 
 ```text
-http://127.0.0.1:3001
+http://127.0.0.1:3002
+```
+
+The vLLM API is also exposed on:
+
+```text
+http://127.0.0.1:8000/v1
+```
+
+The first launch downloads model files into:
+
+```text
+model_cache/huggingface
+```
+
+Docker defaults to `Qwen/Qwen3-32B-AWQ` through vLLM and keeps Whisper on CPU so
+the LLM can use GPU memory. To change ports, model, Hugging Face token, or move
+Whisper to GPU, edit `docker.env`. If port `3002` is already occupied, change
+`APP_PORT`. For RTX 4090 the default `VLLM_MAX_MODEL_LEN=8192` is intentionally
+conservative; increase it only if vLLM starts without VRAM errors.
+
+Stop the stack:
+
+```powershell
+docker compose --env-file docker.env down
 ```
 
 ## Hugging Face Access
@@ -171,17 +216,16 @@ Settings are stored locally in:
 model_cache/model_settings.json
 ```
 
-## Optional vLLM Backend
+## Optional External vLLM Backend
 
-The default LLM backend is local `transformers`, which is the simplest option
-for Windows. For faster summary/protocol generation on Linux, WSL2, Docker, or a
-separate GPU server, you can run vLLM separately and switch the UI setting
-`Backend LLM` to `vLLM OpenAI API`.
+The Windows launcher still uses local `transformers` by default. For the faster
+path, use `start_docker.bat`. If you already have vLLM on another machine, switch
+the UI setting `Backend LLM` to `vLLM OpenAI API`.
 
-Example vLLM server:
+Example external vLLM server:
 
 ```bash
-vllm serve google/gemma-4-E4B-it --host 127.0.0.1 --port 8000 --dtype bfloat16 --trust-remote-code
+vllm serve --model Qwen/Qwen3-32B-AWQ --served-model-name Qwen/Qwen3-32B-AWQ --host 0.0.0.0 --port 8000 --trust-remote-code --quantization awq
 ```
 
 Then set in `Настройки моделей`:
@@ -189,10 +233,10 @@ Then set in `Настройки моделей`:
 ```text
 Backend LLM: vLLM OpenAI API
 vLLM base URL: http://127.0.0.1:8000/v1
-vLLM model: google/gemma-4-E4B-it
+vLLM model: Qwen/Qwen3-32B-AWQ
 ```
 
-If your vLLM server requires an API key, set it before launch:
+If your external vLLM server requires an API key, set it before launch:
 
 ```powershell
 $env:VLLM_API_KEY="your-key"
