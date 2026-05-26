@@ -13,6 +13,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app_logging import LOG_FILE, get_logger, setup_logging
 from model_functions import (
+    DEFAULT_LLM_SYSTEM_PROMPT,
     DEFAULT_PROTOCOL_PROMPT,
     DEFAULT_SUMMARY_PROMPT,
     DEFAULT_TEXT_TASK_INSTRUCTION,
@@ -209,6 +210,7 @@ def save_model_settings_ui(
     summary_model_name,
     vllm_base_url,
     vllm_model_name,
+    llm_system_prompt,
     summary_max_chunk_size,
     summary_max_new_tokens,
 ):
@@ -224,6 +226,7 @@ def save_model_settings_ui(
             summary_model_name=summary_model_name,
             vllm_base_url=vllm_base_url,
             vllm_model_name=vllm_model_name,
+            llm_system_prompt=llm_system_prompt,
             summary_max_chunk_size=summary_max_chunk_size,
             summary_max_new_tokens=summary_max_new_tokens,
         )
@@ -1034,6 +1037,15 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
                     placeholder="Например: google/gemma-4-E4B-it",
                     info="Имя модели, с которым поднят vLLM server.",
                 )
+                llm_system_prompt_input = gr.Textbox(
+                    label="Системный промпт LLM",
+                    value=INITIAL_MODEL_SETTINGS.get(
+                        "llm_system_prompt",
+                        DEFAULT_LLM_SYSTEM_PROMPT,
+                    ),
+                    lines=5,
+                    info="Общие правила для всех LLM-задач: саммари, протокол и свободная работа с текстом.",
+                )
                 summary_chunk_input = gr.Number(
                     label="Размер чанка для саммаризации, токены",
                     value=INITIAL_MODEL_SETTINGS["summary_max_chunk_size"],
@@ -1258,6 +1270,7 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
             summary_model_input,
             vllm_base_url_input,
             vllm_model_input,
+            llm_system_prompt_input,
             summary_chunk_input,
             summary_max_new_tokens_input,
         ],

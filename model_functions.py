@@ -98,6 +98,11 @@ DEFAULT_TEXT_TASK_INSTRUCTION = (
     "Проанализируй транскрипцию. Выдели ключевые темы, важные тезисы, "
     "открытые вопросы и возможные следующие шаги. Ответ дай структурированно."
 )
+DEFAULT_LLM_SYSTEM_PROMPT = (
+    "Ты локальный помощник для анализа русскоязычных транскрипций. "
+    "Отвечай на русском языке, опирайся только на переданный материал, "
+    "не выдумывай факты и сохраняй структуру, которую просит пользователь."
+)
 
 # Cache
 CACHE_DIR = Path.cwd() / "model_cache"
@@ -174,6 +179,7 @@ def _default_model_settings():
         "llm_backend": _normalize_llm_backend(LLM_BACKEND),
         "vllm_base_url": _normalize_vllm_base_url(VLLM_BASE_URL),
         "vllm_model_name": VLLM_MODEL_NAME,
+        "llm_system_prompt": DEFAULT_LLM_SYSTEM_PROMPT,
     }
 
 
@@ -252,6 +258,9 @@ def _load_model_settings_from_disk():
     settings["vllm_model_name"] = (
         settings.get("vllm_model_name") or settings["summary_model_name"] or VLLM_MODEL_NAME
     ).strip()
+    settings["llm_system_prompt"] = (
+        settings.get("llm_system_prompt") or DEFAULT_LLM_SYSTEM_PROMPT
+    ).strip()
     return settings
 
 
@@ -315,6 +324,7 @@ def update_model_settings(
     llm_backend=None,
     vllm_base_url=None,
     vllm_model_name=None,
+    llm_system_prompt=None,
 ):
     global MODEL_SETTINGS
 
@@ -354,6 +364,9 @@ def update_model_settings(
     new_settings["vllm_model_name"] = (
         vllm_model_name or new_settings["summary_model_name"] or VLLM_MODEL_NAME
     ).strip()
+    new_settings["llm_system_prompt"] = (
+        llm_system_prompt or DEFAULT_LLM_SYSTEM_PROMPT
+    ).strip()
 
     _resolve_whisper_device(new_settings["whisper_device"])
 
@@ -372,6 +385,7 @@ def update_model_settings(
         "llm_backend",
         "vllm_base_url",
         "vllm_model_name",
+        "llm_system_prompt",
     }
 
     MODEL_SETTINGS = new_settings
@@ -1080,8 +1094,17 @@ def render_user_prompt(template, default_template, summary):
     return f"{template}\n\nМатериал:\n{summary}"
 
 
-def build_chat_inputs(processor, prompt, model):
-    messages = [{"role": "user", "content": prompt}]
+def build_chat_messages(prompt, system_prompt=None):
+    messages = []
+    system_prompt = (system_prompt or "").strip()
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
+def build_chat_inputs(processor, prompt, model, system_prompt=None):
+    messages = build_chat_messages(prompt, system_prompt=system_prompt)
     tokenizer = _get_tokenizer(processor)
 
     try:
@@ -1170,8 +1193,20 @@ def build_generation_config(model_name, model, processor, max_new_tokens=NEW_TOK
     return generation_config
 
 
-def generate_chat_text(processor, model, prompt, generation_config, clean_output=True):
-    inputs, input_len = build_chat_inputs(processor, prompt, model)
+def generate_chat_text(
+    processor,
+    model,
+    prompt,
+    generation_config,
+    clean_output=True,
+    system_prompt=None,
+):
+    inputs, input_len = build_chat_inputs(
+        processor,
+        prompt,
+        model,
+        system_prompt=system_prompt,
+    )
     if isinstance(inputs, dict):
         outputs = model.generate(**inputs, generation_config=generation_config)
     else:
@@ -1191,10 +1226,11 @@ def generate_vllm_chat_text(
     prompt,
     max_new_tokens=NEW_TOKENS,
     clean_output=True,
+    system_prompt=None,
 ):
     payload = {
         "model": model_name,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": build_chat_messages(prompt, system_prompt=system_prompt),
         "temperature": TEMPERATURE,
         "top_p": 0.7,
         "max_tokens": int(max_new_tokens),
@@ -1274,6 +1310,7 @@ def build_llm_runtime(settings, model_name=None, max_new_tokens=None):
             "base_url": _normalize_vllm_base_url(settings["vllm_base_url"]),
             "model_name": (model_name or settings["vllm_model_name"]).strip(),
             "max_new_tokens": max_new_tokens,
+            "system_prompt": settings.get("llm_system_prompt", ""),
         }
         logger.info(
             "Using vLLM backend: base_url=%s model=%s max_new_tokens=%s",
@@ -1299,6 +1336,7 @@ def build_llm_runtime(settings, model_name=None, max_new_tokens=None):
         "model": model,
         "generation_config": generation_config,
         "max_new_tokens": max_new_tokens,
+        "system_prompt": settings.get("llm_system_prompt", ""),
     }
 
 
@@ -1320,6 +1358,7 @@ def generate_llm_text(runtime, prompt, clean_output=True):
             prompt,
             max_new_tokens=runtime["max_new_tokens"],
             clean_output=clean_output,
+            system_prompt=runtime.get("system_prompt"),
         )
     return generate_chat_text(
         runtime["tokenizer"],
@@ -1327,6 +1366,7 @@ def generate_llm_text(runtime, prompt, clean_output=True):
         prompt,
         runtime["generation_config"],
         clean_output=clean_output,
+        system_prompt=runtime.get("system_prompt"),
     )
 
 

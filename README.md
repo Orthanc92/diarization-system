@@ -158,6 +158,7 @@ Open `Настройки моделей` in the UI to change:
 - Whisper compute type and batch size
 - summary/protocol Hugging Face model id or one of the recommended presets
 - LLM backend: local `transformers` or external `vLLM` OpenAI API
+- system prompt shared by summary, protocol, and free-form text tasks
 - summary chunk size
 - maximum new tokens for each LLM response
 
