@@ -29,6 +29,9 @@ DO_SAMPLE = os.getenv("LLM_DO_SAMPLE", "false").strip().lower() in {
     "yes",
     "on",
 }
+LOCK_SERVICE_LLM_SETTINGS = os.getenv(
+    "LOCK_SERVICE_LLM_SETTINGS", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 NEW_TOKENS = int(os.getenv("SUMMARY_MAX_NEW_TOKENS", "800"))
 SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL_NAME", "Qwen/Qwen3-32B-AWQ")
 SUMMARY_MAX_CHUNK_SIZE = int(os.getenv("SUMMARY_MAX_CHUNK_SIZE", "4096"))
@@ -290,6 +293,24 @@ def _default_model_settings():
     }
 
 
+def _apply_locked_service_llm_settings(settings):
+    if not LOCK_SERVICE_LLM_SETTINGS:
+        return settings
+
+    settings.update(
+        {
+            "summary_model_name": SUMMARY_MODEL_NAME,
+            "summary_max_chunk_size": SUMMARY_MAX_CHUNK_SIZE,
+            "llm_backend": _normalize_llm_backend(LLM_BACKEND),
+            "vllm_base_url": VLLM_BASE_URL,
+            "vllm_model_name": VLLM_MODEL_NAME,
+            "vllm_context_window": VLLM_CONTEXT_WINDOW,
+            "vllm_context_retry_reserve_tokens": VLLM_CONTEXT_RETRY_RESERVE_TOKENS,
+        }
+    )
+    return settings
+
+
 def _normalize_whisper_device(value):
     value = (value or "auto").strip().lower()
     return value if value in {"auto", "cuda", "cpu"} else "auto"
@@ -332,6 +353,8 @@ def _load_model_settings_from_disk():
     except json.JSONDecodeError as exc:
         logger.warning("Invalid model settings JSON in %s: %s", MODEL_SETTINGS_FILE, exc)
         pass
+
+    settings = _apply_locked_service_llm_settings(settings)
 
     settings["whisper_model_name"] = (
         settings.get("whisper_model_name") or WHISPER_MODEL_NAME
@@ -528,6 +551,8 @@ def update_model_settings(
             }
         )
     )
+
+    new_settings = _apply_locked_service_llm_settings(new_settings)
 
     _resolve_whisper_device(new_settings["whisper_device"])
 

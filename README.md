@@ -9,12 +9,12 @@ speaker diarization, summarization, and meeting protocol generation.
 - Speaker diarization with `pyannote.audio`
 - Browser tab/window audio capture for videos that cannot be downloaded
 - Configurable browser audio segment duration for transcription/diarization
-- Summaries and protocols with a local Hugging Face LLM
-- Optional vLLM OpenAI-compatible backend for faster LLM generation
+- Summaries and protocols with a local Hugging Face LLM or Docker vLLM backend
+- vLLM OpenAI-compatible backend for faster LLM generation
 - Free-form text/transcript analysis with custom user instructions
 - Editable prompts for summaries and protocols in the UI
-- Model settings page for Whisper/LLM, including CPU/GPU selection for Whisper
-- Recommended summary/protocol model presets by available VRAM
+- Model settings page for Whisper, prompts, output length, and generation parameters
+- Docker vLLM defaults fixed in `docker.env` to prevent accidental context/model changes
 - Local Hugging Face token storage in `model_cache/hf_token.txt`
 
 ## Quick Start For Windows
@@ -155,8 +155,11 @@ Docker defaults to `Qwen/Qwen3-14B-AWQ` through vLLM and keeps Whisper on CPU so
 the LLM can use GPU memory. To change ports, model, Hugging Face token, or move
 Whisper to GPU, edit `docker.env`. If port `3002` is already occupied, change
 `APP_PORT`. For RTX 4090 the Docker default `VLLM_MAX_MODEL_LEN=32768` allows
-larger text chunks while keeping a practical KV-cache reserve. `Qwen/Qwen3-32B-AWQ` is heavier and can fail on 24 GB GPUs because
-there is not enough memory left for vLLM KV-cache.
+larger text chunks while keeping a practical KV-cache reserve. The app container
+also locks `SUMMARY_MAX_CHUNK_SIZE` from `docker.env`, so old UI-saved settings
+cannot silently override the Docker vLLM context/chunk configuration.
+`Qwen/Qwen3-32B-AWQ` is heavier and can fail on 24 GB GPUs because there is not
+enough memory left for vLLM KV-cache.
 
 Stop the stack:
 
@@ -202,15 +205,18 @@ Open `Настройки моделей` in the UI to change:
 - Whisper model name
 - Whisper device: `auto`, `cuda`, or `cpu`
 - Whisper compute type and batch size
-- summary/protocol Hugging Face model id or one of the recommended presets
-- default LLM preset for new installs: `Qwen/Qwen3-32B-AWQ`
-- AWQ models through `transformers` require `gptqmodel` and Triton. On Windows this project installs `triton-windows`.
-- LLM backend: local `transformers` or external `vLLM` OpenAI API
-- vLLM context window and retry reserve for context-limit handling
 - system prompt shared by summary, protocol, and free-form text tasks
-- summary chunk size
 - maximum new tokens for each LLM response
 - LLM generation parameters: sampling, temperature, top-p, top-k, repetition penalty, and no-repeat n-gram size
+
+The UI intentionally does not expose vLLM backend/model/context/chunk settings.
+For Docker runs they are fixed by `docker.env` and enforced in the app container:
+
+- `VLLM_MODEL_NAME`
+- `VLLM_MAX_MODEL_LEN`
+- `VLLM_CHUNK_CONTEXT_RESERVE_TOKENS`
+- `VLLM_CONTEXT_RETRY_RESERVE_TOKENS`
+- `SUMMARY_MAX_CHUNK_SIZE`
 
 Settings are stored locally in:
 
@@ -220,22 +226,28 @@ model_cache/model_settings.json
 
 ## Optional External vLLM Backend
 
-The Windows launcher still uses local `transformers` by default. For the faster
-path, use `start_docker.bat`. If you already have vLLM on another machine, switch
-the UI setting `Backend LLM` to `vLLM OpenAI API`.
+The recommended faster path is `start_docker.bat`, which starts the internal
+vLLM server and locks the app to the Docker LLM settings. If you already have
+vLLM on another machine, set the backend through environment variables before
+starting the app.
 
 Example external vLLM server:
 
 ```bash
-vllm serve --model Qwen/Qwen3-14B-AWQ --served-model-name Qwen/Qwen3-14B-AWQ --host 0.0.0.0 --port 8000 --trust-remote-code --quantization awq
+vllm serve --model Qwen/Qwen3-14B-AWQ --served-model-name Qwen/Qwen3-14B-AWQ --host 0.0.0.0 --port 8000 --trust-remote-code --quantization awq --max-model-len 32768 --gpu-memory-utilization 0.90
 ```
 
-Then set in `Настройки моделей`:
+Then start the app with:
 
-```text
-Backend LLM: vLLM OpenAI API
-vLLM base URL: http://127.0.0.1:8000/v1
-vLLM model: Qwen/Qwen3-14B-AWQ
+```powershell
+$env:LOCK_SERVICE_LLM_SETTINGS="1"
+$env:LLM_BACKEND="vllm"
+$env:VLLM_BASE_URL="http://127.0.0.1:8000/v1"
+$env:VLLM_MODEL_NAME="Qwen/Qwen3-14B-AWQ"
+$env:SUMMARY_MODEL_NAME="Qwen/Qwen3-14B-AWQ"
+$env:VLLM_CONTEXT_WINDOW="32768"
+$env:SUMMARY_MAX_CHUNK_SIZE="12000"
+.\start_windows.bat
 ```
 
 If your external vLLM server requires an API key, set it before launch:

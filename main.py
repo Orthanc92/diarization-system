@@ -17,9 +17,7 @@ from model_functions import (
     DEFAULT_PROTOCOL_PROMPT,
     DEFAULT_SUMMARY_PROMPT,
     DEFAULT_TEXT_TASK_INSTRUCTION,
-    LLM_BACKEND_TRANSFORMERS,
     LLM_BACKEND_VLLM,
-    RECOMMENDED_SUMMARY_MODELS,
     get_model_settings,
     HF_TOKEN_FILE,
     process_text_with_instruction,
@@ -47,51 +45,6 @@ BROWSER_CAPTURE_LOCK = threading.Lock()
 BROWSER_CAPTURE_TRANSCRIBE_LOCK = threading.Lock()
 BROWSER_CAPTURE_MODE_TRANSCRIPTION = "transcription"
 BROWSER_CAPTURE_MODE_DIARIZATION = "diarization"
-SUMMARY_MODEL_CUSTOM_CHOICE = "Своя модель / ручной HF id"
-
-
-def _summary_model_choice_label(model):
-    return f"{model['vram']} - {model['name']} ({model['model_id']})"
-
-
-SUMMARY_MODEL_CHOICE_TO_ID = {
-    _summary_model_choice_label(model): model["model_id"]
-    for model in RECOMMENDED_SUMMARY_MODELS
-}
-
-
-def _initial_summary_model_choice(model_id):
-    model_id = (model_id or "").strip()
-    for choice, recommended_model_id in SUMMARY_MODEL_CHOICE_TO_ID.items():
-        if recommended_model_id == model_id:
-            return choice
-    return SUMMARY_MODEL_CUSTOM_CHOICE
-
-
-def select_recommended_summary_model(choice, current_model_id, current_vllm_model_id):
-    model_id = SUMMARY_MODEL_CHOICE_TO_ID.get(choice)
-    if not model_id:
-        return [current_model_id, current_vllm_model_id]
-    return [model_id, model_id]
-
-
-def _recommended_summary_models_markdown():
-    rows = [
-        "| Память | Модель | HF id | Когда выбирать |",
-        "| --- | --- | --- | --- |",
-    ]
-    for model in RECOMMENDED_SUMMARY_MODELS:
-        rows.append(
-            f"| {model['vram']} | {model['name']} | `{model['model_id']}` | {model['note']} |"
-        )
-    return (
-        "#### Рекомендации по LLM для саммари и протокола\n\n"
-        "AWQ-пресеты рассчитаны на 4-bit загрузку через `transformers` или `vLLM`; "
-        "остальные оценки даны с запасом для обычной загрузки через `transformers`. "
-        "Фактическое потребление зависит от длины контекста, драйверов и того, загружен ли параллельно Whisper.\n\n"
-        + "\n".join(rows)
-    )
-
 
 def _generation_token_recommendations_markdown():
     return (
@@ -206,6 +159,24 @@ def _model_settings_markdown(settings=None):
     )
 
 
+def _fixed_llm_settings_markdown(settings=None):
+    settings = settings or get_model_settings()
+    llm_model = (
+        settings["vllm_model_name"]
+        if settings["llm_backend"] == LLM_BACKEND_VLLM
+        else settings["summary_model_name"]
+    )
+    return (
+        "**Backend LLM, модель, контекст vLLM и размер чанка зафиксированы "
+        "в конфигурации сервиса.**\n\n"
+        f"- Backend: `{settings['llm_backend']}`\n"
+        f"- Модель: `{llm_model}`\n"
+        f"- Контекст vLLM: `{settings['vllm_context_window']}` токенов\n"
+        f"- Размер чанка: `{settings['summary_max_chunk_size']}` токенов\n\n"
+        "Меняйте эти значения только в `docker.env` и перезапускайте Docker stack."
+    )
+
+
 def save_model_settings_ui(
     whisper_model_name,
     whisper_device,
@@ -213,14 +184,7 @@ def save_model_settings_ui(
     whisper_batch_size,
     whisper_cpu_threads,
     whisper_num_workers,
-    llm_backend,
-    summary_model_name,
-    vllm_base_url,
-    vllm_model_name,
-    vllm_context_window,
-    vllm_context_retry_reserve_tokens,
     llm_system_prompt,
-    summary_max_chunk_size,
     summary_max_new_tokens,
     llm_do_sample,
     llm_temperature,
@@ -230,6 +194,7 @@ def save_model_settings_ui(
     llm_no_repeat_ngram_size,
 ):
     try:
+        fixed_settings = get_model_settings()
         settings = update_model_settings(
             whisper_model_name=whisper_model_name,
             whisper_device=whisper_device,
@@ -237,14 +202,16 @@ def save_model_settings_ui(
             whisper_batch_size=whisper_batch_size,
             whisper_cpu_threads=whisper_cpu_threads,
             whisper_num_workers=whisper_num_workers,
-            llm_backend=llm_backend,
-            summary_model_name=summary_model_name,
-            vllm_base_url=vllm_base_url,
-            vllm_model_name=vllm_model_name,
-            vllm_context_window=vllm_context_window,
-            vllm_context_retry_reserve_tokens=vllm_context_retry_reserve_tokens,
+            llm_backend=fixed_settings["llm_backend"],
+            summary_model_name=fixed_settings["summary_model_name"],
+            vllm_base_url=fixed_settings["vllm_base_url"],
+            vllm_model_name=fixed_settings["vllm_model_name"],
+            vllm_context_window=fixed_settings["vllm_context_window"],
+            vllm_context_retry_reserve_tokens=fixed_settings[
+                "vllm_context_retry_reserve_tokens"
+            ],
             llm_system_prompt=llm_system_prompt,
-            summary_max_chunk_size=summary_max_chunk_size,
+            summary_max_chunk_size=fixed_settings["summary_max_chunk_size"],
             summary_max_new_tokens=summary_max_new_tokens,
             llm_do_sample=llm_do_sample,
             llm_temperature=llm_temperature,
@@ -1022,57 +989,7 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
                     info="Количество worker-потоков faster-whisper.",
                 )
                 gr.Markdown("### LLM / суммаризация и протокол")
-                llm_backend_input = gr.Radio(
-                    label="Backend LLM",
-                    choices=[
-                        (LLM_BACKEND_TRANSFORMERS, LLM_BACKEND_TRANSFORMERS),
-                        ("vLLM OpenAI API", LLM_BACKEND_VLLM),
-                    ],
-                    value=INITIAL_MODEL_SETTINGS["llm_backend"],
-                    info="Transformers работает локально в этом приложении. vLLM использует отдельно запущенный OpenAI-compatible server.",
-                )
-                summary_model_recommendation = gr.Dropdown(
-                    label="Рекомендованная модель по памяти",
-                    choices=[SUMMARY_MODEL_CUSTOM_CHOICE]
-                    + list(SUMMARY_MODEL_CHOICE_TO_ID.keys()),
-                    value=_initial_summary_model_choice(
-                        INITIAL_MODEL_SETTINGS["summary_model_name"]
-                    ),
-                    info="Выберите вариант, чтобы подставить HF id в поле ниже. Затем сохраните настройки.",
-                )
-                summary_model_input = gr.Textbox(
-                    label="Transformers HF id модели",
-                    value=INITIAL_MODEL_SETTINGS["summary_model_name"],
-                    placeholder="Например: google/gemma-4-E4B-it",
-                    info="Используется при backend `transformers`. Модель должна помещаться в видеопамять. Для gated-моделей нужен HF token.",
-                )
-                vllm_base_url_input = gr.Textbox(
-                    label="vLLM base URL",
-                    value=INITIAL_MODEL_SETTINGS["vllm_base_url"],
-                    placeholder="http://127.0.0.1:8000/v1",
-                    info="Используется при backend `vllm`. Запустите vLLM отдельно, например `vllm serve ... --port 8000`.",
-                )
-                vllm_model_input = gr.Textbox(
-                    label="vLLM model",
-                    value=INITIAL_MODEL_SETTINGS["vllm_model_name"],
-                    placeholder="Например: google/gemma-4-E4B-it",
-                    info="Имя модели, с которым поднят vLLM server.",
-                )
-                with gr.Row():
-                    vllm_context_window_input = gr.Number(
-                        label="vLLM context window, tokens",
-                        value=INITIAL_MODEL_SETTINGS["vllm_context_window"],
-                        precision=0,
-                        info="Must match VLLM_MAX_MODEL_LEN in docker.env. Used by the UI and retry logic for context budgeting.",
-                    )
-                    vllm_context_retry_reserve_input = gr.Number(
-                        label="vLLM retry reserve, tokens",
-                        value=INITIAL_MODEL_SETTINGS[
-                            "vllm_context_retry_reserve_tokens"
-                        ],
-                        precision=0,
-                        info="Tokens kept as safety margin when the app retries after a vLLM context overflow.",
-                    )
+                gr.Markdown(_fixed_llm_settings_markdown(INITIAL_MODEL_SETTINGS))
                 llm_system_prompt_input = gr.Textbox(
                     label="Системный промпт LLM",
                     value=INITIAL_MODEL_SETTINGS.get(
@@ -1081,12 +998,6 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
                     ),
                     lines=5,
                     info="Общие правила для всех LLM-задач: саммари, протокол и свободная работа с текстом.",
-                )
-                summary_chunk_input = gr.Number(
-                    label="Размер чанка для саммаризации, токены",
-                    value=INITIAL_MODEL_SETTINGS["summary_max_chunk_size"],
-                    precision=0,
-                    info="Меньше чанки стабильнее, но больше проходов модели. Обычно 3072-4096.",
                 )
                 summary_max_new_tokens_input = gr.Number(
                     label="Макс. токенов ответа модели",
@@ -1137,7 +1048,6 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
                         "`repetition_penalty` 1.1-1.25. Для творческого анализа включите sampling и поднимите temperature."
                     )
             with gr.Column():
-                gr.Markdown(_recommended_summary_models_markdown())
                 gr.Markdown(_generation_token_recommendations_markdown())
                 gr.Markdown(
                     "Подсказка: на RTX 4090 для Whisper обычно выбирайте `auto`/`float16`. "
@@ -1331,12 +1241,6 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
         outputs=[hf_token_state, hf_token_input, hf_token_status],
     )
 
-    summary_model_recommendation.change(
-        fn=select_recommended_summary_model,
-        inputs=[summary_model_recommendation, summary_model_input, vllm_model_input],
-        outputs=[summary_model_input, vllm_model_input],
-    )
-
     save_model_settings_btn.click(
         fn=save_model_settings_ui,
         inputs=[
@@ -1346,14 +1250,7 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
             whisper_batch_input,
             whisper_cpu_threads_input,
             whisper_num_workers_input,
-            llm_backend_input,
-            summary_model_input,
-            vllm_base_url_input,
-            vllm_model_input,
-            vllm_context_window_input,
-            vllm_context_retry_reserve_input,
             llm_system_prompt_input,
-            summary_chunk_input,
             summary_max_new_tokens_input,
             llm_do_sample_input,
             llm_temperature_input,
