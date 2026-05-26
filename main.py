@@ -16,6 +16,8 @@ from model_functions import (
     DEFAULT_PROTOCOL_PROMPT,
     DEFAULT_SUMMARY_PROMPT,
     DEFAULT_TEXT_TASK_INSTRUCTION,
+    LLM_BACKEND_TRANSFORMERS,
+    LLM_BACKEND_VLLM,
     RECOMMENDED_SUMMARY_MODELS,
     get_model_settings,
     HF_TOKEN_FILE,
@@ -65,8 +67,11 @@ def _initial_summary_model_choice(model_id):
     return SUMMARY_MODEL_CUSTOM_CHOICE
 
 
-def select_recommended_summary_model(choice, current_model_id):
-    return SUMMARY_MODEL_CHOICE_TO_ID.get(choice) or current_model_id
+def select_recommended_summary_model(choice, current_model_id, current_vllm_model_id):
+    model_id = SUMMARY_MODEL_CHOICE_TO_ID.get(choice)
+    if not model_id:
+        return [current_model_id, current_vllm_model_id]
+    return [model_id, model_id]
 
 
 def _recommended_summary_models_markdown():
@@ -168,15 +173,26 @@ def clear_hf_token():
 def _model_settings_markdown(settings=None):
     settings = settings or get_model_settings()
     cuda_status = "доступна" if settings["cuda_available"] else "недоступна"
+    llm_model = (
+        settings["vllm_model_name"]
+        if settings["llm_backend"] == LLM_BACKEND_VLLM
+        else settings["summary_model_name"]
+    )
+    vllm_line = (
+        f"\n- vLLM endpoint: `{settings['vllm_base_url']}`."
+        if settings["llm_backend"] == LLM_BACKEND_VLLM
+        else ""
+    )
     return (
         "**Текущие настройки моделей**\n\n"
         f"- Whisper: `{settings['whisper_model_name']}`; "
         f"режим `{settings['whisper_device']}` -> `{settings['whisper_resolved_device']}`; "
         f"compute `{settings['whisper_resolved_compute_type']}`; "
         f"batch `{settings['whisper_batch_size']}`.\n"
-        f"- LLM summary/protocol: `{settings['summary_model_name']}`; "
+        f"- LLM backend: `{settings['llm_backend']}`; model `{llm_model}`; "
         f"размер чанка `{settings['summary_max_chunk_size']}` токенов; "
         f"ответ до `{settings['summary_max_new_tokens']}` новых токенов.\n"
+        f"{vllm_line}\n"
         f"- CUDA: {cuda_status}.\n"
         f"- Логи: `{LOG_FILE}`."
     )
@@ -189,7 +205,10 @@ def save_model_settings_ui(
     whisper_batch_size,
     whisper_cpu_threads,
     whisper_num_workers,
+    llm_backend,
     summary_model_name,
+    vllm_base_url,
+    vllm_model_name,
     summary_max_chunk_size,
     summary_max_new_tokens,
 ):
@@ -201,7 +220,10 @@ def save_model_settings_ui(
             whisper_batch_size=whisper_batch_size,
             whisper_cpu_threads=whisper_cpu_threads,
             whisper_num_workers=whisper_num_workers,
+            llm_backend=llm_backend,
             summary_model_name=summary_model_name,
+            vllm_base_url=vllm_base_url,
+            vllm_model_name=vllm_model_name,
             summary_max_chunk_size=summary_max_chunk_size,
             summary_max_new_tokens=summary_max_new_tokens,
         )
@@ -975,6 +997,15 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
                 )
             with gr.Column():
                 gr.Markdown("### LLM / суммаризация и протокол")
+                llm_backend_input = gr.Radio(
+                    label="Backend LLM",
+                    choices=[
+                        (LLM_BACKEND_TRANSFORMERS, LLM_BACKEND_TRANSFORMERS),
+                        ("vLLM OpenAI API", LLM_BACKEND_VLLM),
+                    ],
+                    value=INITIAL_MODEL_SETTINGS["llm_backend"],
+                    info="Transformers работает локально в этом приложении. vLLM использует отдельно запущенный OpenAI-compatible server.",
+                )
                 gr.Markdown(_recommended_summary_models_markdown())
                 summary_model_recommendation = gr.Dropdown(
                     label="Рекомендованная модель по памяти",
@@ -986,10 +1017,22 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
                     info="Выберите вариант, чтобы подставить HF id в поле ниже. Затем сохраните настройки.",
                 )
                 summary_model_input = gr.Textbox(
-                    label="HF id модели для саммари и протокола",
+                    label="Transformers HF id модели",
                     value=INITIAL_MODEL_SETTINGS["summary_model_name"],
                     placeholder="Например: google/gemma-4-E4B-it",
-                    info="Модель должна помещаться в вашу видеопамять. Для gated-моделей нужен HF token.",
+                    info="Используется при backend `transformers`. Модель должна помещаться в видеопамять. Для gated-моделей нужен HF token.",
+                )
+                vllm_base_url_input = gr.Textbox(
+                    label="vLLM base URL",
+                    value=INITIAL_MODEL_SETTINGS["vllm_base_url"],
+                    placeholder="http://127.0.0.1:8000/v1",
+                    info="Используется при backend `vllm`. Запустите vLLM отдельно, например `vllm serve ... --port 8000`.",
+                )
+                vllm_model_input = gr.Textbox(
+                    label="vLLM model",
+                    value=INITIAL_MODEL_SETTINGS["vllm_model_name"],
+                    placeholder="Например: google/gemma-4-E4B-it",
+                    info="Имя модели, с которым поднят vLLM server.",
                 )
                 summary_chunk_input = gr.Number(
                     label="Размер чанка для саммаризации, токены",
@@ -1198,8 +1241,8 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
 
     summary_model_recommendation.change(
         fn=select_recommended_summary_model,
-        inputs=[summary_model_recommendation, summary_model_input],
-        outputs=summary_model_input,
+        inputs=[summary_model_recommendation, summary_model_input, vllm_model_input],
+        outputs=[summary_model_input, vllm_model_input],
     )
 
     save_model_settings_btn.click(
@@ -1211,7 +1254,10 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
             whisper_batch_input,
             whisper_cpu_threads_input,
             whisper_num_workers_input,
+            llm_backend_input,
             summary_model_input,
+            vllm_base_url_input,
+            vllm_model_input,
             summary_chunk_input,
             summary_max_new_tokens_input,
         ],

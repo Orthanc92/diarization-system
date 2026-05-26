@@ -10,6 +10,7 @@ speaker diarization, summarization, and meeting protocol generation.
 - Browser tab/window audio capture for videos that cannot be downloaded
 - Configurable browser audio segment duration for transcription/diarization
 - Summaries and protocols with a local Hugging Face LLM
+- Optional vLLM OpenAI-compatible backend for faster LLM generation
 - Free-form text/transcript analysis with custom user instructions
 - Editable prompts for summaries and protocols in the UI
 - Model settings page for Whisper/LLM, including CPU/GPU selection for Whisper
@@ -156,6 +157,7 @@ Open `Настройки моделей` in the UI to change:
 - Whisper device: `auto`, `cuda`, or `cpu`
 - Whisper compute type and batch size
 - summary/protocol Hugging Face model id or one of the recommended presets
+- LLM backend: local `transformers` or external `vLLM` OpenAI API
 - summary chunk size
 - maximum new tokens for each LLM response
 
@@ -163,4 +165,32 @@ Settings are stored locally in:
 
 ```text
 model_cache/model_settings.json
+```
+
+## Optional vLLM Backend
+
+The default LLM backend is local `transformers`, which is the simplest option
+for Windows. For faster summary/protocol generation on Linux, WSL2, Docker, or a
+separate GPU server, you can run vLLM separately and switch the UI setting
+`Backend LLM` to `vLLM OpenAI API`.
+
+Example vLLM server:
+
+```bash
+vllm serve google/gemma-4-E4B-it --host 127.0.0.1 --port 8000 --dtype bfloat16 --trust-remote-code
+```
+
+Then set in `Настройки моделей`:
+
+```text
+Backend LLM: vLLM OpenAI API
+vLLM base URL: http://127.0.0.1:8000/v1
+vLLM model: google/gemma-4-E4B-it
+```
+
+If your vLLM server requires an API key, set it before launch:
+
+```powershell
+$env:VLLM_API_KEY="your-key"
+.\start_windows.bat
 ```

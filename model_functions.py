@@ -5,6 +5,8 @@ import subprocess
 import tempfile
 import gc
 import warnings
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
@@ -19,6 +21,12 @@ TEMPERATURE = 0.3
 NEW_TOKENS = int(os.getenv("SUMMARY_MAX_NEW_TOKENS", "800"))
 SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL_NAME", "google/gemma-4-E4B-it")
 SUMMARY_MAX_CHUNK_SIZE = int(os.getenv("SUMMARY_MAX_CHUNK_SIZE", "4096"))
+LLM_BACKEND_TRANSFORMERS = "transformers"
+LLM_BACKEND_VLLM = "vllm"
+LLM_BACKEND = os.getenv("LLM_BACKEND", LLM_BACKEND_TRANSFORMERS)
+VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
+VLLM_MODEL_NAME = os.getenv("VLLM_MODEL_NAME", SUMMARY_MODEL_NAME)
+VLLM_TIMEOUT_SECONDS = float(os.getenv("VLLM_TIMEOUT_SECONDS", "300"))
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL_NAME", "large-v3")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "auto")
@@ -142,6 +150,16 @@ def _positive_int(value, default, minimum=1):
     return value if value >= minimum else default
 
 
+def _normalize_llm_backend(value):
+    value = (value or LLM_BACKEND_TRANSFORMERS).strip().lower()
+    return value if value in {LLM_BACKEND_TRANSFORMERS, LLM_BACKEND_VLLM} else LLM_BACKEND_TRANSFORMERS
+
+
+def _normalize_vllm_base_url(value):
+    value = (value or VLLM_BASE_URL).strip().rstrip("/")
+    return value or VLLM_BASE_URL
+
+
 def _default_model_settings():
     return {
         "whisper_model_name": WHISPER_MODEL_NAME,
@@ -153,6 +171,9 @@ def _default_model_settings():
         "summary_model_name": SUMMARY_MODEL_NAME,
         "summary_max_chunk_size": SUMMARY_MAX_CHUNK_SIZE,
         "summary_max_new_tokens": NEW_TOKENS,
+        "llm_backend": _normalize_llm_backend(LLM_BACKEND),
+        "vllm_base_url": _normalize_vllm_base_url(VLLM_BASE_URL),
+        "vllm_model_name": VLLM_MODEL_NAME,
     }
 
 
@@ -226,6 +247,11 @@ def _load_model_settings_from_disk():
     settings["summary_max_new_tokens"] = _positive_int(
         settings.get("summary_max_new_tokens"), NEW_TOKENS, minimum=64
     )
+    settings["llm_backend"] = _normalize_llm_backend(settings.get("llm_backend"))
+    settings["vllm_base_url"] = _normalize_vllm_base_url(settings.get("vllm_base_url"))
+    settings["vllm_model_name"] = (
+        settings.get("vllm_model_name") or settings["summary_model_name"] or VLLM_MODEL_NAME
+    ).strip()
     return settings
 
 
@@ -286,6 +312,9 @@ def update_model_settings(
     summary_model_name=None,
     summary_max_chunk_size=None,
     summary_max_new_tokens=None,
+    llm_backend=None,
+    vllm_base_url=None,
+    vllm_model_name=None,
 ):
     global MODEL_SETTINGS
 
@@ -320,6 +349,11 @@ def update_model_settings(
         old_settings["summary_max_new_tokens"],
         minimum=64,
     )
+    new_settings["llm_backend"] = _normalize_llm_backend(llm_backend)
+    new_settings["vllm_base_url"] = _normalize_vllm_base_url(vllm_base_url)
+    new_settings["vllm_model_name"] = (
+        vllm_model_name or new_settings["summary_model_name"] or VLLM_MODEL_NAME
+    ).strip()
 
     _resolve_whisper_device(new_settings["whisper_device"])
 
@@ -335,17 +369,22 @@ def update_model_settings(
         "summary_model_name",
         "summary_max_chunk_size",
         "summary_max_new_tokens",
+        "llm_backend",
+        "vllm_base_url",
+        "vllm_model_name",
     }
 
     MODEL_SETTINGS = new_settings
     _save_model_settings_to_disk(new_settings)
     logger.info(
-        "Model settings updated: whisper=%s device=%s compute=%s batch=%s llm=%s chunk=%s max_new_tokens=%s",
+        "Model settings updated: whisper=%s device=%s compute=%s batch=%s backend=%s llm=%s vllm=%s chunk=%s max_new_tokens=%s",
         new_settings["whisper_model_name"],
         new_settings["whisper_device"],
         new_settings["whisper_compute_type"],
         new_settings["whisper_batch_size"],
+        new_settings["llm_backend"],
         new_settings["summary_model_name"],
+        new_settings["vllm_model_name"],
         new_settings["summary_max_chunk_size"],
         new_settings["summary_max_new_tokens"],
     )
@@ -967,6 +1006,36 @@ def split_text_into_chunks(text, processor, max_tokens=SUMMARY_MAX_CHUNK_SIZE):
     return chunks
 
 
+def split_text_into_approx_token_chunks(text, max_tokens=SUMMARY_MAX_CHUNK_SIZE):
+    """Split text without loading a tokenizer, for remote OpenAI-compatible backends."""
+    max_chars = max(1000, int(max_tokens) * 4)
+    paragraphs = re.split(r"(\n\s*\n)", text)
+    chunks = []
+    current = ""
+
+    for part in paragraphs:
+        if not part:
+            continue
+        if len(part) > max_chars:
+            if current.strip():
+                chunks.append(current.strip())
+                current = ""
+            for index in range(0, len(part), max_chars):
+                chunk = part[index : index + max_chars].strip()
+                if chunk:
+                    chunks.append(chunk)
+            continue
+        if len(current) + len(part) > max_chars and current.strip():
+            chunks.append(current.strip())
+            current = part
+        else:
+            current += part
+
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks or [text]
+
+
 def prepare_text_for_summary(text):
     text = re.sub(r"^\[Сегмент \d+\]\s*", "", text, flags=re.MULTILINE)
     text = re.sub(
@@ -1112,6 +1181,155 @@ def generate_chat_text(processor, model, prompt, generation_config, clean_output
     return clean_generated_text(text) if clean_output else text.strip()
 
 
+def vllm_chat_url(base_url):
+    return f"{_normalize_vllm_base_url(base_url)}/chat/completions"
+
+
+def generate_vllm_chat_text(
+    base_url,
+    model_name,
+    prompt,
+    max_new_tokens=NEW_TOKENS,
+    clean_output=True,
+):
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": TEMPERATURE,
+        "top_p": 0.7,
+        "max_tokens": int(max_new_tokens),
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    headers = {"Content-Type": "application/json"}
+    api_key = (os.getenv("VLLM_API_KEY") or "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    def send_request(request_payload):
+        request = urllib.request.Request(
+            vllm_chat_url(base_url),
+            data=json.dumps(request_payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=VLLM_TIMEOUT_SECONDS) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    try:
+        logger.debug(
+            "Sending vLLM chat request: url=%s model=%s max_tokens=%s",
+            vllm_chat_url(base_url),
+            model_name,
+            max_new_tokens,
+        )
+        response_data = send_request(payload)
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")[-2000:]
+        if "chat_template_kwargs" in error_body:
+            logger.warning(
+                "vLLM rejected chat_template_kwargs, retrying without it: %s",
+                error_body,
+            )
+            payload.pop("chat_template_kwargs", None)
+            try:
+                response_data = send_request(payload)
+            except urllib.error.HTTPError as retry_exc:
+                retry_body = retry_exc.read().decode("utf-8", errors="replace")[-2000:]
+                raise RuntimeError(
+                    f"vLLM вернул HTTP {retry_exc.code}: {retry_body}"
+                ) from retry_exc
+        else:
+            raise RuntimeError(
+                f"vLLM вернул HTTP {exc.code}: {error_body}"
+            ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Не удалось подключиться к vLLM по адресу {base_url}: {exc}"
+        ) from exc
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"vLLM не ответил за {VLLM_TIMEOUT_SECONDS} секунд по адресу {base_url}"
+        ) from exc
+
+    try:
+        text = response_data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"Неожиданный ответ vLLM: {response_data}") from exc
+
+    return clean_generated_text(text) if clean_output else (text or "").strip()
+
+
+def build_llm_runtime(settings, model_name=None, max_new_tokens=None):
+    backend = _normalize_llm_backend(settings.get("llm_backend"))
+    max_new_tokens = _positive_int(
+        max_new_tokens,
+        settings["summary_max_new_tokens"],
+        minimum=64,
+    )
+
+    if backend == LLM_BACKEND_VLLM:
+        runtime = {
+            "backend": LLM_BACKEND_VLLM,
+            "base_url": _normalize_vllm_base_url(settings["vllm_base_url"]),
+            "model_name": (model_name or settings["vllm_model_name"]).strip(),
+            "max_new_tokens": max_new_tokens,
+        }
+        logger.info(
+            "Using vLLM backend: base_url=%s model=%s max_new_tokens=%s",
+            runtime["base_url"],
+            runtime["model_name"],
+            runtime["max_new_tokens"],
+        )
+        unload_hf_model()
+        return runtime
+
+    runtime_model_name = (model_name or settings["summary_model_name"]).strip()
+    tokenizer, model = load_hf_model(runtime_model_name)
+    generation_config = build_generation_config(
+        runtime_model_name,
+        model,
+        tokenizer,
+        max_new_tokens=max_new_tokens,
+    )
+    return {
+        "backend": LLM_BACKEND_TRANSFORMERS,
+        "model_name": runtime_model_name,
+        "tokenizer": tokenizer,
+        "model": model,
+        "generation_config": generation_config,
+        "max_new_tokens": max_new_tokens,
+    }
+
+
+def split_text_for_llm_runtime(text, runtime, max_chunk_size):
+    if runtime["backend"] == LLM_BACKEND_VLLM:
+        return split_text_into_approx_token_chunks(text, max_tokens=max_chunk_size)
+    return split_text_into_chunks(
+        text,
+        runtime["tokenizer"],
+        max_tokens=max_chunk_size,
+    )
+
+
+def generate_llm_text(runtime, prompt, clean_output=True):
+    if runtime["backend"] == LLM_BACKEND_VLLM:
+        return generate_vllm_chat_text(
+            runtime["base_url"],
+            runtime["model_name"],
+            prompt,
+            max_new_tokens=runtime["max_new_tokens"],
+            clean_output=clean_output,
+        )
+    return generate_chat_text(
+        runtime["tokenizer"],
+        runtime["model"],
+        prompt,
+        runtime["generation_config"],
+        clean_output=clean_output,
+    )
+
+
 def render_text_task_prompt(instruction, text):
     instruction = (instruction or "").strip()
     text = (text or "").strip()
@@ -1148,40 +1366,26 @@ def process_text_with_instruction(
         text = prepare_text_for_summary(text)
         instruction = instruction.strip()
         settings = get_model_settings()
-        model_name = (model_name or settings["summary_model_name"]).strip()
         max_chunk_size = _positive_int(
             max_chunk_size,
             settings["summary_max_chunk_size"],
             minimum=256,
         )
-        max_new_tokens = _positive_int(
-            max_new_tokens,
-            settings["summary_max_new_tokens"],
-            minimum=64,
-        )
-
-        tokenizer, model = load_hf_model(model_name)
-        generation_config = build_generation_config(
-            model_name,
-            model,
-            tokenizer,
-            max_new_tokens=max_new_tokens,
-        )
-        chunks = split_text_into_chunks(text, tokenizer, max_tokens=max_chunk_size)
+        runtime = build_llm_runtime(settings, model_name=model_name, max_new_tokens=max_new_tokens)
+        chunks = split_text_for_llm_runtime(text, runtime, max_chunk_size)
         logger.info(
-            "Free-form text task chunks prepared: chunks=%s max_chunk_size=%s max_new_tokens=%s model=%s",
+            "Free-form text task chunks prepared: chunks=%s max_chunk_size=%s max_new_tokens=%s model=%s backend=%s",
             len(chunks),
             max_chunk_size,
-            max_new_tokens,
-            model_name,
+            runtime["max_new_tokens"],
+            runtime["model_name"],
+            runtime["backend"],
         )
 
         if len(chunks) == 1:
-            result = generate_chat_text(
-                tokenizer,
-                model,
+            result = generate_llm_text(
+                runtime,
                 render_text_task_prompt(instruction, chunks[0]),
-                generation_config,
                 clean_output=False,
             )
             logger.info("Free-form text task completed: output_chars=%s", len(result))
@@ -1197,11 +1401,9 @@ def process_text_with_instruction(
                 f"Задача:\n{instruction}\n\n"
                 f"Фрагмент {index} из {total_chunks}:\n{chunk}"
             )
-            partial = generate_chat_text(
-                tokenizer,
-                model,
+            partial = generate_llm_text(
+                runtime,
                 prompt,
-                generation_config,
                 clean_output=False,
             )
             partial_results.append(f"[Фрагмент {index}]\n{partial}")
@@ -1214,11 +1416,9 @@ def process_text_with_instruction(
             "Частичные ответы:\n"
             + "\n\n".join(partial_results)
         )
-        result = generate_chat_text(
-            tokenizer,
-            model,
+        result = generate_llm_text(
+            runtime,
             final_prompt,
-            generation_config,
             clean_output=False,
         )
         logger.info("Free-form text task completed: output_chars=%s partials=%s", len(result), len(partial_results))
@@ -1249,33 +1449,20 @@ def summarize_text_with_prompt_optimized(
         logger.info("Summarization requested: input_chars=%s make_protocol=%s", len(text), make_protocol)
         text = prepare_text_for_summary(text)
         settings = get_model_settings()
-        model_name = (model_name or settings["summary_model_name"]).strip()
         max_chunk_size = _positive_int(
             max_chunk_size,
             settings["summary_max_chunk_size"],
             minimum=256,
         )
-        max_new_tokens = _positive_int(
-            max_new_tokens,
-            settings["summary_max_new_tokens"],
-            minimum=64,
-        )
-
-        tokenizer, model = load_hf_model(model_name)
-        generation_config = build_generation_config(
-            model_name,
-            model,
-            tokenizer,
-            max_new_tokens=max_new_tokens,
-        )
-
-        chunks = split_text_into_chunks(text, tokenizer, max_tokens=max_chunk_size)
+        runtime = build_llm_runtime(settings, model_name=model_name, max_new_tokens=max_new_tokens)
+        chunks = split_text_for_llm_runtime(text, runtime, max_chunk_size)
         logger.info(
-            "Summarization chunks prepared: chunks=%s max_chunk_size=%s max_new_tokens=%s model=%s",
+            "Summarization chunks prepared: chunks=%s max_chunk_size=%s max_new_tokens=%s model=%s backend=%s",
             len(chunks),
             max_chunk_size,
-            max_new_tokens,
-            model_name,
+            runtime["max_new_tokens"],
+            runtime["model_name"],
+            runtime["backend"],
         )
         summaries = []
 
@@ -1289,7 +1476,7 @@ def summarize_text_with_prompt_optimized(
 
         for chunk in chunks:
             prompt = prompt_template.format(chunk)
-            summary = generate_chat_text(tokenizer, model, prompt, generation_config)
+            summary = generate_llm_text(runtime, prompt)
             summaries.append(summary)
 
         combined_summary = clean_generated_text("\n".join(summaries))
@@ -1300,11 +1487,9 @@ def summarize_text_with_prompt_optimized(
                 DEFAULT_SUMMARY_PROMPT,
                 combined_summary,
             )
-            result = generate_chat_text(
-                tokenizer,
-                model,
+            result = generate_llm_text(
+                runtime,
                 final_summary_prompt,
-                generation_config,
             )
             logger.info("Summary completed: output_chars=%s chunk_summaries=%s", len(result), len(summaries))
             return result
@@ -1316,11 +1501,9 @@ def summarize_text_with_prompt_optimized(
         )
 
         try:
-            final_summary = generate_chat_text(
-                tokenizer,
-                model,
+            final_summary = generate_llm_text(
+                runtime,
                 final_prompt,
-                generation_config,
             )
 
             if final_summary.startswith(final_prompt):
