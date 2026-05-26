@@ -42,6 +42,9 @@ VLLM_CONTEXT_WINDOW = max(
     1024,
     int(os.getenv("VLLM_CONTEXT_WINDOW", os.getenv("VLLM_MAX_MODEL_LEN", "8192"))),
 )
+VLLM_CHUNK_CONTEXT_RESERVE_TOKENS = max(
+    0, int(os.getenv("VLLM_CHUNK_CONTEXT_RESERVE_TOKENS", "1024"))
+)
 VLLM_CONTEXT_RETRY_RESERVE_TOKENS = max(
     0, int(os.getenv("VLLM_CONTEXT_RETRY_RESERVE_TOKENS", "16"))
 )
@@ -1543,7 +1546,7 @@ def generate_vllm_chat_text(
         with urllib.request.urlopen(request, timeout=VLLM_TIMEOUT_SECONDS) as response:
             return json.loads(response.read().decode("utf-8"))
 
-    def retry_without_optional_fields(request_payload, previous_error_body):
+    def without_optional_fields(request_payload):
         retry_payload = dict(request_payload)
         retry_removed_keys = [
             key
@@ -1556,68 +1559,73 @@ def generate_vllm_chat_text(
             if key in retry_payload
         ]
         if not retry_removed_keys:
-            return None
-        logger.warning(
-            "vLLM rejected optional request fields, retrying without %s: %s",
-            retry_removed_keys,
-            previous_error_body,
-        )
+            return None, []
         for key in retry_removed_keys:
             retry_payload.pop(key, None)
-        try:
-            return send_request(retry_payload)
-        except urllib.error.HTTPError as retry_exc:
-            retry_body = retry_exc.read().decode("utf-8", errors="replace")[-2000:]
-            raise RuntimeError(
-                f"vLLM returned HTTP {retry_exc.code}: {retry_body}"
-            ) from retry_exc
+        return retry_payload, retry_removed_keys
 
+    request_payload = dict(payload)
+    optional_fields_removed = False
+    response_data = None
     try:
-        logger.debug(
-            "Sending vLLM chat request: url=%s model=%s max_tokens=%s",
-            vllm_chat_url(base_url),
-            model_name,
-            max_new_tokens,
-        )
-        response_data = send_request(payload)
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")[-2000:]
-        adjusted_max_tokens = (
-            adjusted_vllm_max_tokens_from_context_error(
-                error_body,
-                payload["max_tokens"],
-                reserve_tokens=context_retry_reserve_tokens,
-            )
-            if exc.code == 400
-            else None
-        )
-        if adjusted_max_tokens is not None:
-            if adjusted_max_tokens < VLLM_MIN_CONTEXT_RETRY_TOKENS:
-                raise RuntimeError(
-                    f"vLLM returned HTTP {exc.code}: {error_body}"
-                ) from exc
-            retry_payload = dict(payload)
-            retry_payload["max_tokens"] = adjusted_max_tokens
-            logger.warning(
-                "vLLM context limit hit, retrying with max_tokens=%s instead of %s",
-                adjusted_max_tokens,
-                payload["max_tokens"],
-            )
+        for attempt in range(1, 5):
             try:
-                response_data = send_request(retry_payload)
-            except urllib.error.HTTPError as retry_exc:
-                retry_body = retry_exc.read().decode("utf-8", errors="replace")[-2000:]
-                response_data = retry_without_optional_fields(retry_payload, retry_body)
-                if response_data is None:
-                    raise RuntimeError(
-                        f"vLLM returned HTTP {retry_exc.code}: {retry_body}"
-                    ) from retry_exc
-        else:
-            response_data = retry_without_optional_fields(payload, error_body)
-            if response_data is None:
+                logger.debug(
+                    "Sending vLLM chat request: url=%s model=%s max_tokens=%s attempt=%s",
+                    vllm_chat_url(base_url),
+                    model_name,
+                    request_payload["max_tokens"],
+                    attempt,
+                )
+                response_data = send_request(request_payload)
+                break
+            except urllib.error.HTTPError as exc:
+                error_body = exc.read().decode("utf-8", errors="replace")[-2000:]
+                adjusted_max_tokens = (
+                    adjusted_vllm_max_tokens_from_context_error(
+                        error_body,
+                        request_payload["max_tokens"],
+                        reserve_tokens=context_retry_reserve_tokens,
+                    )
+                    if exc.code == 400
+                    else None
+                )
+                if adjusted_max_tokens is not None:
+                    if adjusted_max_tokens < VLLM_MIN_CONTEXT_RETRY_TOKENS:
+                        raise RuntimeError(
+                            f"vLLM returned HTTP {exc.code}: {error_body}"
+                        ) from exc
+                    if adjusted_max_tokens >= int(request_payload["max_tokens"]):
+                        raise RuntimeError(
+                            f"vLLM returned HTTP {exc.code}: {error_body}"
+                        ) from exc
+                    logger.warning(
+                        "vLLM context limit hit, retrying with max_tokens=%s instead of %s",
+                        adjusted_max_tokens,
+                        request_payload["max_tokens"],
+                    )
+                    request_payload = dict(request_payload)
+                    request_payload["max_tokens"] = adjusted_max_tokens
+                    continue
+
+                retry_payload, retry_removed_keys = without_optional_fields(request_payload)
+                if retry_payload is not None and not optional_fields_removed:
+                    optional_fields_removed = True
+                    request_payload = retry_payload
+                    logger.warning(
+                        "vLLM rejected optional request fields, retrying without %s: %s",
+                        retry_removed_keys,
+                        error_body,
+                    )
+                    continue
                 raise RuntimeError(
                     f"vLLM returned HTTP {exc.code}: {error_body}"
                 ) from exc
+        else:
+            raise RuntimeError("vLLM request failed after context-limit retries")
+
+        if response_data is None:
+            raise RuntimeError("vLLM returned an empty response")
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not connect to vLLM at {base_url}: {exc}") from exc
     except TimeoutError as exc:
@@ -1691,7 +1699,26 @@ def build_llm_runtime(settings, model_name=None, max_new_tokens=None):
 
 def split_text_for_llm_runtime(text, runtime, max_chunk_size):
     if runtime["backend"] == LLM_BACKEND_VLLM:
-        return split_text_into_approx_token_chunks(text, max_tokens=max_chunk_size)
+        context_budget = (
+            int(runtime.get("context_window") or VLLM_CONTEXT_WINDOW)
+            - int(runtime.get("max_new_tokens") or NEW_TOKENS)
+            - int(
+                runtime.get("context_retry_reserve_tokens")
+                or VLLM_CONTEXT_RETRY_RESERVE_TOKENS
+            )
+            - VLLM_CHUNK_CONTEXT_RESERVE_TOKENS
+        )
+        effective_chunk_size = max(256, min(int(max_chunk_size), context_budget))
+        if effective_chunk_size < int(max_chunk_size):
+            logger.info(
+                "Reducing vLLM chunk size from %s to %s to fit context budget",
+                max_chunk_size,
+                effective_chunk_size,
+            )
+        return split_text_into_approx_token_chunks(
+            text,
+            max_tokens=effective_chunk_size,
+        )
     return split_text_into_chunks(
         text,
         runtime["tokenizer"],
