@@ -158,7 +158,7 @@ Open `Настройки моделей` in the UI to change:
 - Whisper compute type and batch size
 - summary/protocol Hugging Face model id or one of the recommended presets
 - default LLM preset for new installs: `Qwen/Qwen3-32B-AWQ`
-- AWQ models through `transformers` require `autoawq` and `optimum`
+- AWQ models through `transformers` require `gptqmodel`
 - LLM backend: local `transformers` or external `vLLM` OpenAI API
 - system prompt shared by summary, protocol, and free-form text tasks
 - summary chunk size

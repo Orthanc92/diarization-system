@@ -1128,15 +1128,11 @@ def load_hf_model(model_name=None):
         (quant_method or "").lower() == "awq"
         or model_name.lower().endswith("-awq")
     )
-    awq_missing_packages = []
-    if is_awq_model and not _package_available("awq"):
-        awq_missing_packages.append("autoawq")
-    if is_awq_model and not _package_available("optimum"):
-        awq_missing_packages.append("optimum")
-    if awq_missing_packages:
+    if is_awq_model and not _package_available("gptqmodel"):
         raise RuntimeError(
             f"Модель {model_name} использует AWQ-квантизацию. "
-            f"Установите зависимости: pip install {' '.join(awq_missing_packages)}"
+            "Для текущей версии transformers нужен пакет gptqmodel: "
+            "pip install gptqmodel"
         )
 
     try:
@@ -1178,8 +1174,9 @@ def load_hf_model(model_name=None):
         if is_awq_model:
             raise RuntimeError(
                 f"Не удалось загрузить AWQ-модель {model_name}. "
-                "Проверьте, что установлены autoawq и optimum, а на GPU достаточно памяти. "
-                "Для RTX 4090 закройте другие модели или временно переключите Whisper на CPU."
+                "Проверьте, что установлен gptqmodel, а на GPU достаточно памяти. "
+                "Для RTX 4090 закройте другие модели или временно переключите Whisper на CPU. "
+                f"Детали: {exc}"
             ) from exc
         raise RuntimeError(f"Не удалось загрузить LLM-модель {model_name}: {exc}") from exc
     hf_tokenizer = processor
