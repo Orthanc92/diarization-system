@@ -1015,7 +1015,6 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
                     precision=0,
                     info="Количество worker-потоков faster-whisper.",
                 )
-            with gr.Column():
                 gr.Markdown("### LLM / суммаризация и протокол")
                 llm_backend_input = gr.Radio(
                     label="Backend LLM",
@@ -1026,7 +1025,6 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
                     value=INITIAL_MODEL_SETTINGS["llm_backend"],
                     info="Transformers работает локально в этом приложении. vLLM использует отдельно запущенный OpenAI-compatible server.",
                 )
-                gr.Markdown(_recommended_summary_models_markdown())
                 summary_model_recommendation = gr.Dropdown(
                     label="Рекомендованная модель по памяти",
                     choices=[SUMMARY_MODEL_CUSTOM_CHOICE]
@@ -1117,6 +1115,8 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
                         "Рекомендация для протоколов: `do_sample` выключен, `temperature` 0.2-0.4, `top_p` 0.7-0.9, "
                         "`repetition_penalty` 1.1-1.25. Для творческого анализа включите sampling и поднимите temperature."
                     )
+            with gr.Column():
+                gr.Markdown(_recommended_summary_models_markdown())
                 gr.Markdown(_generation_token_recommendations_markdown())
                 gr.Markdown(
                     "Подсказка: на RTX 4090 для Whisper обычно выбирайте `auto`/`float16`. "
