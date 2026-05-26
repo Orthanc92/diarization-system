@@ -15,7 +15,7 @@ COPY requirements.txt .
 
 RUN python -m pip install --upgrade pip && \
     python -m pip install --no-cache-dir torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128 && \
-    grep -Ev '^(torch|torchaudio)==?' requirements.txt > /tmp/requirements-docker.txt && \
+    grep -Ev '^(torch|torchaudio|gptqmodel|triton-windows)==?' requirements.txt > /tmp/requirements-docker.txt && \
     python -m pip install --no-cache-dir -r /tmp/requirements-docker.txt
 
 COPY . .
