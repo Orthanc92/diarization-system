@@ -193,6 +193,10 @@ def _model_settings_markdown(settings=None):
         f"- LLM backend: `{settings['llm_backend']}`; model `{llm_model}`; "
         f"размер чанка `{settings['summary_max_chunk_size']}` токенов; "
         f"ответ до `{settings['summary_max_new_tokens']}` новых токенов.\n"
+        f"- Генерация: sampling `{settings['llm_do_sample']}`; "
+        f"temperature `{settings['llm_temperature']}`; top_p `{settings['llm_top_p']}`; "
+        f"top_k `{settings['llm_top_k']}`; repetition `{settings['llm_repetition_penalty']}`; "
+        f"no_repeat_ngram `{settings['llm_no_repeat_ngram_size']}`.\n"
         f"{vllm_line}\n"
         f"- CUDA: {cuda_status}.\n"
         f"- Логи: `{LOG_FILE}`."
@@ -213,6 +217,12 @@ def save_model_settings_ui(
     llm_system_prompt,
     summary_max_chunk_size,
     summary_max_new_tokens,
+    llm_do_sample,
+    llm_temperature,
+    llm_top_p,
+    llm_top_k,
+    llm_repetition_penalty,
+    llm_no_repeat_ngram_size,
 ):
     try:
         settings = update_model_settings(
@@ -229,6 +239,12 @@ def save_model_settings_ui(
             llm_system_prompt=llm_system_prompt,
             summary_max_chunk_size=summary_max_chunk_size,
             summary_max_new_tokens=summary_max_new_tokens,
+            llm_do_sample=llm_do_sample,
+            llm_temperature=llm_temperature,
+            llm_top_p=llm_top_p,
+            llm_top_k=llm_top_k,
+            llm_repetition_penalty=llm_repetition_penalty,
+            llm_no_repeat_ngram_size=llm_no_repeat_ngram_size,
         )
         return [
             _model_settings_markdown(settings),
@@ -1058,6 +1074,48 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
                     precision=0,
                     info="Лимит новых токенов на один ответ LLM. Увеличьте для подробных протоколов и анализа больших текстов.",
                 )
+                with gr.Accordion("Параметры генерации LLM", open=False):
+                    llm_do_sample_input = gr.Checkbox(
+                        label="Sampling / do_sample",
+                        value=INITIAL_MODEL_SETTINGS["llm_do_sample"],
+                        info="Если выключено, модель отвечает более детерминированно. Если включено, temperature/top_p/top_k начинают сильнее влиять на вариативность.",
+                    )
+                    with gr.Row():
+                        llm_temperature_input = gr.Number(
+                            label="Temperature",
+                            value=INITIAL_MODEL_SETTINGS["llm_temperature"],
+                            precision=2,
+                            info="Случайность ответа: 0-0.2 строже, 0.3-0.7 живее, выше 1 может быть менее стабильно.",
+                        )
+                        llm_top_p_input = gr.Number(
+                            label="Top-p",
+                            value=INITIAL_MODEL_SETTINGS["llm_top_p"],
+                            precision=2,
+                            info="Nucleus sampling: модель выбирает из наиболее вероятных токенов с суммарной вероятностью до этого значения. Обычно 0.7-0.95.",
+                        )
+                    with gr.Row():
+                        llm_top_k_input = gr.Number(
+                            label="Top-k",
+                            value=INITIAL_MODEL_SETTINGS["llm_top_k"],
+                            precision=0,
+                            info="Ограничивает выбор k самыми вероятными токенами. 0 отключает ограничение.",
+                        )
+                        llm_repetition_penalty_input = gr.Number(
+                            label="Repetition penalty",
+                            value=INITIAL_MODEL_SETTINGS["llm_repetition_penalty"],
+                            precision=2,
+                            info="Штраф за повторы. 1.0 отключает штраф, 1.1-1.3 обычно уменьшает зацикливание.",
+                        )
+                    llm_no_repeat_ngram_input = gr.Number(
+                        label="No repeat n-gram size",
+                        value=INITIAL_MODEL_SETTINGS["llm_no_repeat_ngram_size"],
+                        precision=0,
+                        info="Запрещает повтор n-грамм указанной длины. 0 отключает, 4-8 помогает против повторов в длинных ответах.",
+                    )
+                    gr.Markdown(
+                        "Рекомендация для протоколов: `do_sample` выключен, `temperature` 0.2-0.4, `top_p` 0.7-0.9, "
+                        "`repetition_penalty` 1.1-1.25. Для творческого анализа включите sampling и поднимите temperature."
+                    )
                 gr.Markdown(_generation_token_recommendations_markdown())
                 gr.Markdown(
                     "Подсказка: на RTX 4090 для Whisper обычно выбирайте `auto`/`float16`. "
@@ -1273,6 +1331,12 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
             llm_system_prompt_input,
             summary_chunk_input,
             summary_max_new_tokens_input,
+            llm_do_sample_input,
+            llm_temperature_input,
+            llm_top_p_input,
+            llm_top_k_input,
+            llm_repetition_penalty_input,
+            llm_no_repeat_ngram_input,
         ],
         outputs=[model_settings_status, model_settings_save_status],
     )

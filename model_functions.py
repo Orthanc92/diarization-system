@@ -18,6 +18,16 @@ logger = get_logger(__name__)
 
 # Configuration
 TEMPERATURE = 0.3
+TOP_P = 0.7
+TOP_K = 0
+REPETITION_PENALTY = 1.2
+NO_REPEAT_NGRAM_SIZE = 6
+DO_SAMPLE = os.getenv("LLM_DO_SAMPLE", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 NEW_TOKENS = int(os.getenv("SUMMARY_MAX_NEW_TOKENS", "800"))
 SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL_NAME", "google/gemma-4-E4B-it")
 SUMMARY_MAX_CHUNK_SIZE = int(os.getenv("SUMMARY_MAX_CHUNK_SIZE", "4096"))
@@ -155,6 +165,41 @@ def _positive_int(value, default, minimum=1):
     return value if value >= minimum else default
 
 
+def _non_negative_int(value, default):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+def _bounded_float(value, default, minimum=None, maximum=None):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _to_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    value = str(value).strip().lower()
+    if value in {"1", "true", "yes", "on", "y", "да"}:
+        return True
+    if value in {"0", "false", "no", "off", "n", "нет"}:
+        return False
+    return default
+
+
 def _normalize_llm_backend(value):
     value = (value or LLM_BACKEND_TRANSFORMERS).strip().lower()
     return value if value in {LLM_BACKEND_TRANSFORMERS, LLM_BACKEND_VLLM} else LLM_BACKEND_TRANSFORMERS
@@ -163,6 +208,36 @@ def _normalize_llm_backend(value):
 def _normalize_vllm_base_url(value):
     value = (value or VLLM_BASE_URL).strip().rstrip("/")
     return value or VLLM_BASE_URL
+
+
+def _normalize_generation_settings(settings):
+    settings = settings or {}
+    return {
+        "llm_do_sample": _to_bool(settings.get("llm_do_sample"), DO_SAMPLE),
+        "llm_temperature": _bounded_float(
+            settings.get("llm_temperature"),
+            TEMPERATURE,
+            minimum=0.0,
+            maximum=2.0,
+        ),
+        "llm_top_p": _bounded_float(
+            settings.get("llm_top_p"),
+            TOP_P,
+            minimum=0.01,
+            maximum=1.0,
+        ),
+        "llm_top_k": _non_negative_int(settings.get("llm_top_k"), TOP_K),
+        "llm_repetition_penalty": _bounded_float(
+            settings.get("llm_repetition_penalty"),
+            REPETITION_PENALTY,
+            minimum=0.1,
+            maximum=3.0,
+        ),
+        "llm_no_repeat_ngram_size": _non_negative_int(
+            settings.get("llm_no_repeat_ngram_size"),
+            NO_REPEAT_NGRAM_SIZE,
+        ),
+    }
 
 
 def _default_model_settings():
@@ -180,6 +255,12 @@ def _default_model_settings():
         "vllm_base_url": _normalize_vllm_base_url(VLLM_BASE_URL),
         "vllm_model_name": VLLM_MODEL_NAME,
         "llm_system_prompt": DEFAULT_LLM_SYSTEM_PROMPT,
+        "llm_do_sample": DO_SAMPLE,
+        "llm_temperature": TEMPERATURE,
+        "llm_top_p": TOP_P,
+        "llm_top_k": TOP_K,
+        "llm_repetition_penalty": REPETITION_PENALTY,
+        "llm_no_repeat_ngram_size": NO_REPEAT_NGRAM_SIZE,
     }
 
 
@@ -261,6 +342,7 @@ def _load_model_settings_from_disk():
     settings["llm_system_prompt"] = (
         settings.get("llm_system_prompt") or DEFAULT_LLM_SYSTEM_PROMPT
     ).strip()
+    settings.update(_normalize_generation_settings(settings))
     return settings
 
 
@@ -325,6 +407,12 @@ def update_model_settings(
     vllm_base_url=None,
     vllm_model_name=None,
     llm_system_prompt=None,
+    llm_do_sample=None,
+    llm_temperature=None,
+    llm_top_p=None,
+    llm_top_k=None,
+    llm_repetition_penalty=None,
+    llm_no_repeat_ngram_size=None,
 ):
     global MODEL_SETTINGS
 
@@ -367,6 +455,35 @@ def update_model_settings(
     new_settings["llm_system_prompt"] = (
         llm_system_prompt or DEFAULT_LLM_SYSTEM_PROMPT
     ).strip()
+    new_settings.update(
+        _normalize_generation_settings(
+            {
+                **old_settings,
+                "llm_do_sample": (
+                    llm_do_sample
+                    if llm_do_sample is not None
+                    else old_settings.get("llm_do_sample")
+                ),
+                "llm_temperature": (
+                    llm_temperature
+                    if llm_temperature is not None
+                    else old_settings.get("llm_temperature")
+                ),
+                "llm_top_p": llm_top_p if llm_top_p is not None else old_settings.get("llm_top_p"),
+                "llm_top_k": llm_top_k if llm_top_k is not None else old_settings.get("llm_top_k"),
+                "llm_repetition_penalty": (
+                    llm_repetition_penalty
+                    if llm_repetition_penalty is not None
+                    else old_settings.get("llm_repetition_penalty")
+                ),
+                "llm_no_repeat_ngram_size": (
+                    llm_no_repeat_ngram_size
+                    if llm_no_repeat_ngram_size is not None
+                    else old_settings.get("llm_no_repeat_ngram_size")
+                ),
+            }
+        )
+    )
 
     _resolve_whisper_device(new_settings["whisper_device"])
 
@@ -386,12 +503,18 @@ def update_model_settings(
         "vllm_base_url",
         "vllm_model_name",
         "llm_system_prompt",
+        "llm_do_sample",
+        "llm_temperature",
+        "llm_top_p",
+        "llm_top_k",
+        "llm_repetition_penalty",
+        "llm_no_repeat_ngram_size",
     }
 
     MODEL_SETTINGS = new_settings
     _save_model_settings_to_disk(new_settings)
     logger.info(
-        "Model settings updated: whisper=%s device=%s compute=%s batch=%s backend=%s llm=%s vllm=%s chunk=%s max_new_tokens=%s",
+        "Model settings updated: whisper=%s device=%s compute=%s batch=%s backend=%s llm=%s vllm=%s chunk=%s max_new_tokens=%s do_sample=%s temperature=%s top_p=%s top_k=%s repetition_penalty=%s no_repeat_ngram_size=%s",
         new_settings["whisper_model_name"],
         new_settings["whisper_device"],
         new_settings["whisper_compute_type"],
@@ -401,6 +524,12 @@ def update_model_settings(
         new_settings["vllm_model_name"],
         new_settings["summary_max_chunk_size"],
         new_settings["summary_max_new_tokens"],
+        new_settings["llm_do_sample"],
+        new_settings["llm_temperature"],
+        new_settings["llm_top_p"],
+        new_settings["llm_top_k"],
+        new_settings["llm_repetition_penalty"],
+        new_settings["llm_no_repeat_ngram_size"],
     )
 
     if any(old_settings[key] != new_settings[key] for key in whisper_keys):
@@ -1159,9 +1288,16 @@ def build_chat_inputs(processor, prompt, model, system_prompt=None):
         return inputs, inputs["input_ids"].shape[-1]
 
 
-def build_generation_config(model_name, model, processor, max_new_tokens=NEW_TOKENS):
+def build_generation_config(
+    model_name,
+    model,
+    processor,
+    max_new_tokens=NEW_TOKENS,
+    generation_settings=None,
+):
     from transformers import GenerationConfig
 
+    generation_settings = _normalize_generation_settings(generation_settings)
     generation_kwargs = {"cache_dir": CACHE_DIR}
     token = _hf_token()
     if token:
@@ -1173,22 +1309,30 @@ def build_generation_config(model_name, model, processor, max_new_tokens=NEW_TOK
         )
     except Exception:
         generation_config = model.generation_config
-    generation_config.temperature = TEMPERATURE
-    generation_config.top_p = 0.7
-    generation_config.repetition_penalty = 1.2
+    generation_config.temperature = generation_settings["llm_temperature"]
+    generation_config.top_p = generation_settings["llm_top_p"]
+    generation_config.top_k = generation_settings["llm_top_k"]
+    generation_config.repetition_penalty = generation_settings["llm_repetition_penalty"]
     generation_config.max_new_tokens = max_new_tokens
-    generation_config.no_repeat_ngram_size = 6
+    generation_config.no_repeat_ngram_size = generation_settings[
+        "llm_no_repeat_ngram_size"
+    ]
     base_tokenizer = _get_tokenizer(processor)
     generation_config.eos_token_id = base_tokenizer.eos_token_id
     generation_config.pad_token_id = (
         base_tokenizer.pad_token_id or base_tokenizer.eos_token_id
     )
-    generation_config.do_sample = False
+    generation_config.do_sample = generation_settings["llm_do_sample"]
     logger.debug(
-        "Generation config prepared: model=%s max_new_tokens=%s temperature=%s",
+        "Generation config prepared: model=%s max_new_tokens=%s do_sample=%s temperature=%s top_p=%s top_k=%s repetition_penalty=%s no_repeat_ngram_size=%s",
         model_name,
         max_new_tokens,
-        TEMPERATURE,
+        generation_config.do_sample,
+        generation_config.temperature,
+        generation_config.top_p,
+        generation_config.top_k,
+        generation_config.repetition_penalty,
+        generation_config.no_repeat_ngram_size,
     )
     return generation_config
 
@@ -1227,16 +1371,29 @@ def generate_vllm_chat_text(
     max_new_tokens=NEW_TOKENS,
     clean_output=True,
     system_prompt=None,
+    generation_settings=None,
 ):
+    generation_settings = _normalize_generation_settings(generation_settings)
+    temperature = (
+        generation_settings["llm_temperature"]
+        if generation_settings["llm_do_sample"]
+        else 0.0
+    )
     payload = {
         "model": model_name,
         "messages": build_chat_messages(prompt, system_prompt=system_prompt),
-        "temperature": TEMPERATURE,
-        "top_p": 0.7,
+        "temperature": temperature,
+        "top_p": generation_settings["llm_top_p"],
         "max_tokens": int(max_new_tokens),
         "stream": False,
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    if generation_settings["llm_top_k"] > 0:
+        payload["top_k"] = generation_settings["llm_top_k"]
+    if generation_settings["llm_repetition_penalty"] != 1.0:
+        payload["repetition_penalty"] = generation_settings["llm_repetition_penalty"]
+    if generation_settings["llm_no_repeat_ngram_size"] > 0:
+        payload["no_repeat_ngram_size"] = generation_settings["llm_no_repeat_ngram_size"]
     headers = {"Content-Type": "application/json"}
     api_key = (os.getenv("VLLM_API_KEY") or "").strip()
     if api_key:
@@ -1262,14 +1419,27 @@ def generate_vllm_chat_text(
         response_data = send_request(payload)
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")[-2000:]
-        if "chat_template_kwargs" in error_body:
+        retry_payload = dict(payload)
+        retry_removed_keys = [
+            key
+            for key in (
+                "chat_template_kwargs",
+                "top_k",
+                "repetition_penalty",
+                "no_repeat_ngram_size",
+            )
+            if key in retry_payload
+        ]
+        if retry_removed_keys:
             logger.warning(
-                "vLLM rejected chat_template_kwargs, retrying without it: %s",
+                "vLLM rejected optional request fields, retrying without %s: %s",
+                retry_removed_keys,
                 error_body,
             )
-            payload.pop("chat_template_kwargs", None)
+            for key in retry_removed_keys:
+                retry_payload.pop(key, None)
             try:
-                response_data = send_request(payload)
+                response_data = send_request(retry_payload)
             except urllib.error.HTTPError as retry_exc:
                 retry_body = retry_exc.read().decode("utf-8", errors="replace")[-2000:]
                 raise RuntimeError(
@@ -1298,6 +1468,7 @@ def generate_vllm_chat_text(
 
 def build_llm_runtime(settings, model_name=None, max_new_tokens=None):
     backend = _normalize_llm_backend(settings.get("llm_backend"))
+    generation_settings = _normalize_generation_settings(settings)
     max_new_tokens = _positive_int(
         max_new_tokens,
         settings["summary_max_new_tokens"],
@@ -1311,12 +1482,16 @@ def build_llm_runtime(settings, model_name=None, max_new_tokens=None):
             "model_name": (model_name or settings["vllm_model_name"]).strip(),
             "max_new_tokens": max_new_tokens,
             "system_prompt": settings.get("llm_system_prompt", ""),
+            "generation_settings": generation_settings,
         }
         logger.info(
-            "Using vLLM backend: base_url=%s model=%s max_new_tokens=%s",
+            "Using vLLM backend: base_url=%s model=%s max_new_tokens=%s do_sample=%s temperature=%s top_p=%s",
             runtime["base_url"],
             runtime["model_name"],
             runtime["max_new_tokens"],
+            generation_settings["llm_do_sample"],
+            generation_settings["llm_temperature"],
+            generation_settings["llm_top_p"],
         )
         unload_hf_model()
         return runtime
@@ -1328,6 +1503,7 @@ def build_llm_runtime(settings, model_name=None, max_new_tokens=None):
         model,
         tokenizer,
         max_new_tokens=max_new_tokens,
+        generation_settings=generation_settings,
     )
     return {
         "backend": LLM_BACKEND_TRANSFORMERS,
@@ -1337,6 +1513,7 @@ def build_llm_runtime(settings, model_name=None, max_new_tokens=None):
         "generation_config": generation_config,
         "max_new_tokens": max_new_tokens,
         "system_prompt": settings.get("llm_system_prompt", ""),
+        "generation_settings": generation_settings,
     }
 
 
@@ -1359,6 +1536,7 @@ def generate_llm_text(runtime, prompt, clean_output=True):
             max_new_tokens=runtime["max_new_tokens"],
             clean_output=clean_output,
             system_prompt=runtime.get("system_prompt"),
+            generation_settings=runtime.get("generation_settings"),
         )
     return generate_chat_text(
         runtime["tokenizer"],

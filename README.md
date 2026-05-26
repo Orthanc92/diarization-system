@@ -161,6 +161,7 @@ Open `Настройки моделей` in the UI to change:
 - system prompt shared by summary, protocol, and free-form text tasks
 - summary chunk size
 - maximum new tokens for each LLM response
+- LLM generation parameters: sampling, temperature, top-p, top-k, repetition penalty, and no-repeat n-gram size
 
 Settings are stored locally in:
 
