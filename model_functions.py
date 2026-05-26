@@ -38,6 +38,10 @@ LLM_BACKEND = os.getenv("LLM_BACKEND", LLM_BACKEND_TRANSFORMERS)
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
 VLLM_MODEL_NAME = os.getenv("VLLM_MODEL_NAME", SUMMARY_MODEL_NAME)
 VLLM_TIMEOUT_SECONDS = float(os.getenv("VLLM_TIMEOUT_SECONDS", "300"))
+VLLM_CONTEXT_WINDOW = max(
+    1024,
+    int(os.getenv("VLLM_CONTEXT_WINDOW", os.getenv("VLLM_MAX_MODEL_LEN", "8192"))),
+)
 VLLM_CONTEXT_RETRY_RESERVE_TOKENS = max(
     0, int(os.getenv("VLLM_CONTEXT_RETRY_RESERVE_TOKENS", "16"))
 )
@@ -271,6 +275,8 @@ def _default_model_settings():
         "llm_backend": _normalize_llm_backend(LLM_BACKEND),
         "vllm_base_url": _normalize_vllm_base_url(VLLM_BASE_URL),
         "vllm_model_name": VLLM_MODEL_NAME,
+        "vllm_context_window": VLLM_CONTEXT_WINDOW,
+        "vllm_context_retry_reserve_tokens": VLLM_CONTEXT_RETRY_RESERVE_TOKENS,
         "llm_system_prompt": DEFAULT_LLM_SYSTEM_PROMPT,
         "llm_do_sample": DO_SAMPLE,
         "llm_temperature": TEMPERATURE,
@@ -356,6 +362,13 @@ def _load_model_settings_from_disk():
     settings["vllm_model_name"] = (
         settings.get("vllm_model_name") or settings["summary_model_name"] or VLLM_MODEL_NAME
     ).strip()
+    settings["vllm_context_window"] = _positive_int(
+        settings.get("vllm_context_window"), VLLM_CONTEXT_WINDOW, minimum=1024
+    )
+    settings["vllm_context_retry_reserve_tokens"] = _non_negative_int(
+        settings.get("vllm_context_retry_reserve_tokens"),
+        VLLM_CONTEXT_RETRY_RESERVE_TOKENS,
+    )
     settings["llm_system_prompt"] = (
         settings.get("llm_system_prompt") or DEFAULT_LLM_SYSTEM_PROMPT
     ).strip()
@@ -423,6 +436,8 @@ def update_model_settings(
     llm_backend=None,
     vllm_base_url=None,
     vllm_model_name=None,
+    vllm_context_window=None,
+    vllm_context_retry_reserve_tokens=None,
     llm_system_prompt=None,
     llm_do_sample=None,
     llm_temperature=None,
@@ -469,6 +484,15 @@ def update_model_settings(
     new_settings["vllm_model_name"] = (
         vllm_model_name or new_settings["summary_model_name"] or VLLM_MODEL_NAME
     ).strip()
+    new_settings["vllm_context_window"] = _positive_int(
+        vllm_context_window,
+        old_settings["vllm_context_window"],
+        minimum=1024,
+    )
+    new_settings["vllm_context_retry_reserve_tokens"] = _non_negative_int(
+        vllm_context_retry_reserve_tokens,
+        old_settings["vllm_context_retry_reserve_tokens"],
+    )
     new_settings["llm_system_prompt"] = (
         llm_system_prompt or DEFAULT_LLM_SYSTEM_PROMPT
     ).strip()
@@ -519,6 +543,8 @@ def update_model_settings(
         "llm_backend",
         "vllm_base_url",
         "vllm_model_name",
+        "vllm_context_window",
+        "vllm_context_retry_reserve_tokens",
         "llm_system_prompt",
         "llm_do_sample",
         "llm_temperature",
@@ -531,7 +557,7 @@ def update_model_settings(
     MODEL_SETTINGS = new_settings
     _save_model_settings_to_disk(new_settings)
     logger.info(
-        "Model settings updated: whisper=%s device=%s compute=%s batch=%s backend=%s llm=%s vllm=%s chunk=%s max_new_tokens=%s do_sample=%s temperature=%s top_p=%s top_k=%s repetition_penalty=%s no_repeat_ngram_size=%s",
+        "Model settings updated: whisper=%s device=%s compute=%s batch=%s backend=%s llm=%s vllm=%s vllm_context=%s chunk=%s max_new_tokens=%s do_sample=%s temperature=%s top_p=%s top_k=%s repetition_penalty=%s no_repeat_ngram_size=%s",
         new_settings["whisper_model_name"],
         new_settings["whisper_device"],
         new_settings["whisper_compute_type"],
@@ -539,6 +565,7 @@ def update_model_settings(
         new_settings["llm_backend"],
         new_settings["summary_model_name"],
         new_settings["vllm_model_name"],
+        new_settings["vllm_context_window"],
         new_settings["summary_max_chunk_size"],
         new_settings["summary_max_new_tokens"],
         new_settings["llm_do_sample"],
@@ -1428,7 +1455,12 @@ def vllm_chat_url(base_url):
     return f"{_normalize_vllm_base_url(base_url)}/chat/completions"
 
 
-def adjusted_vllm_max_tokens_from_context_error(error_body, current_max_tokens):
+def adjusted_vllm_max_tokens_from_context_error(
+    error_body,
+    current_max_tokens,
+    reserve_tokens=None,
+    min_retry_tokens=None,
+):
     max_context_match = re.search(
         r"maximum context length is\s+(\d+)\s+tokens",
         error_body,
@@ -1452,8 +1484,16 @@ def adjusted_vllm_max_tokens_from_context_error(error_body, current_max_tokens):
     if current_max_tokens <= remaining_tokens:
         return None
 
-    if remaining_tokens > VLLM_MIN_CONTEXT_RETRY_TOKENS + VLLM_CONTEXT_RETRY_RESERVE_TOKENS:
-        remaining_tokens -= VLLM_CONTEXT_RETRY_RESERVE_TOKENS
+    reserve_tokens = _non_negative_int(
+        reserve_tokens,
+        VLLM_CONTEXT_RETRY_RESERVE_TOKENS,
+    )
+    min_retry_tokens = _positive_int(
+        min_retry_tokens,
+        VLLM_MIN_CONTEXT_RETRY_TOKENS,
+    )
+    if remaining_tokens > min_retry_tokens + reserve_tokens:
+        remaining_tokens -= reserve_tokens
     return max(1, remaining_tokens)
 
 
@@ -1465,6 +1505,7 @@ def generate_vllm_chat_text(
     clean_output=True,
     system_prompt=None,
     generation_settings=None,
+    context_retry_reserve_tokens=None,
 ):
     generation_settings = _normalize_generation_settings(generation_settings)
     temperature = (
@@ -1545,6 +1586,7 @@ def generate_vllm_chat_text(
             adjusted_vllm_max_tokens_from_context_error(
                 error_body,
                 payload["max_tokens"],
+                reserve_tokens=context_retry_reserve_tokens,
             )
             if exc.code == 400
             else None
@@ -1606,13 +1648,18 @@ def build_llm_runtime(settings, model_name=None, max_new_tokens=None):
             "base_url": _normalize_vllm_base_url(settings["vllm_base_url"]),
             "model_name": (model_name or settings["vllm_model_name"]).strip(),
             "max_new_tokens": max_new_tokens,
+            "context_window": settings["vllm_context_window"],
+            "context_retry_reserve_tokens": settings[
+                "vllm_context_retry_reserve_tokens"
+            ],
             "system_prompt": settings.get("llm_system_prompt", ""),
             "generation_settings": generation_settings,
         }
         logger.info(
-            "Using vLLM backend: base_url=%s model=%s max_new_tokens=%s do_sample=%s temperature=%s top_p=%s",
+            "Using vLLM backend: base_url=%s model=%s context=%s max_new_tokens=%s do_sample=%s temperature=%s top_p=%s",
             runtime["base_url"],
             runtime["model_name"],
+            runtime["context_window"],
             runtime["max_new_tokens"],
             generation_settings["llm_do_sample"],
             generation_settings["llm_temperature"],
@@ -1662,6 +1709,7 @@ def generate_llm_text(runtime, prompt, clean_output=True):
             clean_output=clean_output,
             system_prompt=runtime.get("system_prompt"),
             generation_settings=runtime.get("generation_settings"),
+            context_retry_reserve_tokens=runtime.get("context_retry_reserve_tokens"),
         )
     return generate_chat_text(
         runtime["tokenizer"],

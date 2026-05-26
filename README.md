@@ -206,6 +206,7 @@ Open `Настройки моделей` in the UI to change:
 - default LLM preset for new installs: `Qwen/Qwen3-32B-AWQ`
 - AWQ models through `transformers` require `gptqmodel` and Triton. On Windows this project installs `triton-windows`.
 - LLM backend: local `transformers` or external `vLLM` OpenAI API
+- vLLM context window and retry reserve for context-limit handling
 - system prompt shared by summary, protocol, and free-form text tasks
 - summary chunk size
 - maximum new tokens for each LLM response

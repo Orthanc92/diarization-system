@@ -181,7 +181,9 @@ def _model_settings_markdown(settings=None):
         else settings["summary_model_name"]
     )
     vllm_line = (
-        f"\n- vLLM endpoint: `{settings['vllm_base_url']}`."
+        f"\n- vLLM endpoint: `{settings['vllm_base_url']}`; "
+        f"context `{settings['vllm_context_window']}` tokens; "
+        f"retry reserve `{settings['vllm_context_retry_reserve_tokens']}` tokens."
         if settings["llm_backend"] == LLM_BACKEND_VLLM
         else ""
     )
@@ -215,6 +217,8 @@ def save_model_settings_ui(
     summary_model_name,
     vllm_base_url,
     vllm_model_name,
+    vllm_context_window,
+    vllm_context_retry_reserve_tokens,
     llm_system_prompt,
     summary_max_chunk_size,
     summary_max_new_tokens,
@@ -237,6 +241,8 @@ def save_model_settings_ui(
             summary_model_name=summary_model_name,
             vllm_base_url=vllm_base_url,
             vllm_model_name=vllm_model_name,
+            vllm_context_window=vllm_context_window,
+            vllm_context_retry_reserve_tokens=vllm_context_retry_reserve_tokens,
             llm_system_prompt=llm_system_prompt,
             summary_max_chunk_size=summary_max_chunk_size,
             summary_max_new_tokens=summary_max_new_tokens,
@@ -1052,6 +1058,21 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
                     placeholder="Например: google/gemma-4-E4B-it",
                     info="Имя модели, с которым поднят vLLM server.",
                 )
+                with gr.Row():
+                    vllm_context_window_input = gr.Number(
+                        label="vLLM context window, tokens",
+                        value=INITIAL_MODEL_SETTINGS["vllm_context_window"],
+                        precision=0,
+                        info="Must match VLLM_MAX_MODEL_LEN in docker.env. Used by the UI and retry logic for context budgeting.",
+                    )
+                    vllm_context_retry_reserve_input = gr.Number(
+                        label="vLLM retry reserve, tokens",
+                        value=INITIAL_MODEL_SETTINGS[
+                            "vllm_context_retry_reserve_tokens"
+                        ],
+                        precision=0,
+                        info="Tokens kept as safety margin when the app retries after a vLLM context overflow.",
+                    )
                 llm_system_prompt_input = gr.Textbox(
                     label="Системный промпт LLM",
                     value=INITIAL_MODEL_SETTINGS.get(
@@ -1329,6 +1350,8 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
             summary_model_input,
             vllm_base_url_input,
             vllm_model_input,
+            vllm_context_window_input,
+            vllm_context_retry_reserve_input,
             llm_system_prompt_input,
             summary_chunk_input,
             summary_max_new_tokens_input,
