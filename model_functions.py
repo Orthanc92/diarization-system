@@ -7,6 +7,7 @@ import gc
 import warnings
 import urllib.error
 import urllib.request
+import importlib.util
 from collections import defaultdict
 from pathlib import Path
 
@@ -29,7 +30,7 @@ DO_SAMPLE = os.getenv("LLM_DO_SAMPLE", "false").strip().lower() in {
     "on",
 }
 NEW_TOKENS = int(os.getenv("SUMMARY_MAX_NEW_TOKENS", "800"))
-SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL_NAME", "google/gemma-4-E4B-it")
+SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL_NAME", "Qwen/Qwen3-32B-AWQ")
 SUMMARY_MAX_CHUNK_SIZE = int(os.getenv("SUMMARY_MAX_CHUNK_SIZE", "4096"))
 LLM_BACKEND_TRANSFORMERS = "transformers"
 LLM_BACKEND_VLLM = "vllm"
@@ -51,6 +52,12 @@ DIARIZATION_MODEL_NAME = os.getenv(
     "pyannote-community/speaker-diarization-community-1",
 )
 RECOMMENDED_SUMMARY_MODELS = [
+    {
+        "name": "Qwen3 32B AWQ",
+        "model_id": "Qwen/Qwen3-32B-AWQ",
+        "vram": "24 GB / AWQ 4-bit",
+        "note": "лучшее качество для RTX 4090; работает через transformers и vLLM, требует autoawq",
+    },
     {
         "name": "Qwen3 1.7B",
         "model_id": "Qwen/Qwen3-1.7B",
@@ -238,6 +245,10 @@ def _normalize_generation_settings(settings):
             NO_REPEAT_NGRAM_SIZE,
         ),
     }
+
+
+def _package_available(module_name):
+    return importlib.util.find_spec(module_name) is not None
 
 
 def _default_model_settings():
@@ -1084,7 +1095,7 @@ def transcribe_audio_live(
 
 def load_hf_model(model_name=None):
     global hf_tokenizer, hf_model, hf_model_name
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     model_name = (model_name or get_model_settings()["summary_model_name"]).strip()
     if hf_tokenizer is not None and hf_model is not None and hf_model_name == model_name:
@@ -1101,6 +1112,33 @@ def load_hf_model(model_name=None):
     if token:
         common_kwargs["token"] = token
 
+    quantization_config = None
+    try:
+        model_config = AutoConfig.from_pretrained(model_name, **common_kwargs)
+        quantization_config = getattr(model_config, "quantization_config", None)
+    except Exception:
+        logger.warning("Could not read LLM config before loading: %s", model_name)
+
+    quant_method = None
+    if isinstance(quantization_config, dict):
+        quant_method = quantization_config.get("quant_method")
+    elif quantization_config is not None:
+        quant_method = getattr(quantization_config, "quant_method", None)
+    is_awq_model = (
+        (quant_method or "").lower() == "awq"
+        or model_name.lower().endswith("-awq")
+    )
+    awq_missing_packages = []
+    if is_awq_model and not _package_available("awq"):
+        awq_missing_packages.append("autoawq")
+    if is_awq_model and not _package_available("optimum"):
+        awq_missing_packages.append("optimum")
+    if awq_missing_packages:
+        raise RuntimeError(
+            f"Модель {model_name} использует AWQ-квантизацию. "
+            f"Установите зависимости: pip install {' '.join(awq_missing_packages)}"
+        )
+
     try:
         logger.info("Loading LLM tokenizer: %s", model_name)
         processor = AutoTokenizer.from_pretrained(model_name, **common_kwargs)
@@ -1108,25 +1146,42 @@ def load_hf_model(model_name=None):
         logger.exception("LLM tokenizer loading failed: %s", model_name)
         raise RuntimeError(
             f"Не удалось загрузить токенизатор для {model_name}. "
-            "Для Gemma 4 нужен transformers>=5.9.0 и huggingface-hub>=1.5.0; "
+            "Для Qwen3/Gemma нужен transformers>=5.9.0 и huggingface-hub>=1.5.0; "
             "если модель gated, сохраните Hugging Face token в интерфейсе."
         ) from exc
 
     model_kwargs = {
         **common_kwargs,
         "device_map": "auto",
-        "torch_dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        "low_cpu_mem_usage": True,
     }
+    if is_awq_model:
+        model_kwargs["torch_dtype"] = "auto"
+    else:
+        model_kwargs["torch_dtype"] = (
+            torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        )
     if torch.cuda.is_available():
         model_kwargs["attn_implementation"] = "sdpa"
 
     logger.info(
-        "Loading LLM model: model=%s cuda=%s dtype=%s",
+        "Loading LLM model: model=%s cuda=%s dtype=%s awq=%s",
         model_name,
         torch.cuda.is_available(),
         model_kwargs["torch_dtype"],
+        is_awq_model,
     )
-    hf_model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    try:
+        hf_model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    except Exception as exc:
+        logger.exception("LLM model loading failed: %s", model_name)
+        if is_awq_model:
+            raise RuntimeError(
+                f"Не удалось загрузить AWQ-модель {model_name}. "
+                "Проверьте, что установлены autoawq и optimum, а на GPU достаточно памяти. "
+                "Для RTX 4090 закройте другие модели или временно переключите Whisper на CPU."
+            ) from exc
+        raise RuntimeError(f"Не удалось загрузить LLM-модель {model_name}: {exc}") from exc
     hf_tokenizer = processor
     hf_model_name = model_name
     logger.info("LLM model loaded: %s", model_name)
