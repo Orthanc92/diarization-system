@@ -106,6 +106,26 @@ window to stop it.
 This exe is a launcher, not a monolithic bundle with PyTorch and all models
 inside. It expects the project folder and `.venv` to stay next to it.
 
+## Docker Desktop Launcher
+
+For the Docker/vLLM path you can build a small launcher exe that does not bundle
+models or Python dependencies. It starts Docker Compose in the background, waits
+for the Gradio UI, and opens the browser:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup_docker_app.ps1
+```
+
+The script creates:
+
+- `.launcher-venv` with PyInstaller only
+- `dist\DiarizationSystemDocker.exe`
+- Desktop shortcut `Diarization System Docker`
+
+Before launching it, start Docker Desktop. The first run can still take a long
+time because Docker downloads images and model files. The UI includes
+`Завершить Docker`, which stops the Docker Compose containers for this service.
+
 ## Docker + vLLM
 
 Docker is the recommended path when you want faster LLM generation. The Compose
@@ -130,7 +150,7 @@ Or manually:
 
 ```powershell
 copy docker.env.example docker.env
-docker compose --env-file docker.env up --build
+docker compose --env-file docker.env up --build -d
 ```
 
 Open:
@@ -166,6 +186,10 @@ Stop the stack:
 ```powershell
 docker compose --env-file docker.env down
 ```
+
+The Docker UI shutdown button uses the Docker socket mounted into the app
+container. This is intended for a local desktop setup only; do not expose this
+container to untrusted networks.
 
 ## Hugging Face Access
 

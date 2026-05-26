@@ -232,6 +232,7 @@ function Copy-AppToInstallDir {
     $excludeDirs = @(
         ".git",
         ".venv",
+        ".launcher-venv",
         "venv",
         "__pycache__",
         "model_cache",

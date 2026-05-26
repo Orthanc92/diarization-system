@@ -1,3 +1,5 @@
+name: ${COMPOSE_PROJECT_NAME:-diarization-system}
+
 services:
   vllm:
     image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
@@ -71,6 +73,9 @@ services:
       SUMMARY_MAX_CHUNK_SIZE: ${SUMMARY_MAX_CHUNK_SIZE:-12000}
       SUMMARY_MAX_NEW_TOKENS: ${SUMMARY_MAX_NEW_TOKENS:-2500}
       LOCK_SERVICE_LLM_SETTINGS: "1"
+      ALLOW_DOCKER_SHUTDOWN: ${ALLOW_DOCKER_SHUTDOWN:-1}
+      DOCKER_COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-diarization-system}
+      DOCKER_SOCKET_PATH: /var/run/docker.sock
       LLM_BACKEND: vllm
       VLLM_BASE_URL: http://vllm:8000/v1
       VLLM_MODEL_NAME: ${VLLM_MODEL_NAME:-Qwen/Qwen3-14B-AWQ}
@@ -96,3 +101,4 @@ services:
       - ./browser_capture_chunks:/app/browser_capture_chunks
       - ./logs:/app/logs
       - ./model_cache:/app/model_cache
+      - /var/run/docker.sock:/var/run/docker.sock

@@ -1,8 +1,12 @@
 import os
 import uuid
 import hashlib
+import http.client
+import json
+import socket
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 import gradio as gr
@@ -45,6 +49,121 @@ BROWSER_CAPTURE_LOCK = threading.Lock()
 BROWSER_CAPTURE_TRANSCRIBE_LOCK = threading.Lock()
 BROWSER_CAPTURE_MODE_TRANSCRIPTION = "transcription"
 BROWSER_CAPTURE_MODE_DIARIZATION = "diarization"
+DOCKER_SHUTDOWN_ENABLED = os.getenv("ALLOW_DOCKER_SHUTDOWN", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DOCKER_SOCKET_PATH = os.getenv("DOCKER_SOCKET_PATH", "/var/run/docker.sock")
+DOCKER_COMPOSE_PROJECT_NAME = (
+    os.getenv("DOCKER_COMPOSE_PROJECT_NAME")
+    or os.getenv("COMPOSE_PROJECT_NAME")
+    or "diarization-system"
+)
+
+
+class DockerUnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, socket_path, timeout=10):
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+def _docker_api_request(method, path):
+    if not DOCKER_SHUTDOWN_ENABLED:
+        raise RuntimeError("Остановка Docker отключена в конфигурации сервиса.")
+    if not Path(DOCKER_SOCKET_PATH).exists():
+        raise RuntimeError(
+            f"Docker socket не найден: {DOCKER_SOCKET_PATH}. "
+            "Запустите сервис через docker-compose с примонтированным socket."
+        )
+
+    connection = DockerUnixHTTPConnection(DOCKER_SOCKET_PATH)
+    try:
+        connection.request(method, path)
+        response = connection.getresponse()
+        body = response.read()
+        if response.status >= 400:
+            details = body.decode("utf-8", errors="replace")
+            raise RuntimeError(f"Docker API вернул HTTP {response.status}: {details}")
+        return body
+    finally:
+        connection.close()
+
+
+def _list_compose_containers():
+    filters = urllib.parse.quote(
+        json.dumps(
+            {
+                "label": [
+                    f"com.docker.compose.project={DOCKER_COMPOSE_PROJECT_NAME}"
+                ]
+            }
+        )
+    )
+    body = _docker_api_request("GET", f"/containers/json?all=0&filters={filters}")
+    return json.loads(body.decode("utf-8"))
+
+
+def _container_display_name(container):
+    names = container.get("Names") or []
+    if names:
+        return names[0].lstrip("/")
+    return container.get("Id", "")[:12]
+
+
+def _stop_containers_after_response(containers):
+    time.sleep(1.5)
+    current_hostname = socket.gethostname()
+    ordered = sorted(
+        containers,
+        key=lambda item: item.get("Id", "").startswith(current_hostname),
+    )
+    for container in ordered:
+        container_id = container.get("Id")
+        if not container_id:
+            continue
+        try:
+            logger.info(
+                "Stopping Docker container from UI: %s",
+                _container_display_name(container),
+            )
+            _docker_api_request("POST", f"/containers/{container_id}/stop?t=10")
+        except Exception:
+            logger.exception("Could not stop Docker container: %s", container_id[:12])
+
+
+def shutdown_docker_stack():
+    try:
+        containers = _list_compose_containers()
+        if not containers:
+            return (
+                f"Контейнеры Docker stack `{DOCKER_COMPOSE_PROJECT_NAME}` не найдены."
+            )
+        names = ", ".join(_container_display_name(container) for container in containers)
+        threading.Thread(
+            target=_stop_containers_after_response,
+            args=(containers,),
+            daemon=True,
+        ).start()
+        logger.info(
+            "Docker stack shutdown requested from UI: project=%s containers=%s",
+            DOCKER_COMPOSE_PROJECT_NAME,
+            names,
+        )
+        return (
+            f"Останавливаю Docker stack `{DOCKER_COMPOSE_PROJECT_NAME}`: {names}. "
+            "Через несколько секунд страница перестанет отвечать."
+        )
+    except Exception as exc:
+        logger.exception("Docker stack shutdown failed")
+        return f"Не удалось остановить Docker stack: {exc}"
+
 
 def _generation_token_recommendations_markdown():
     return (
@@ -934,6 +1053,18 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
     live_transcription_key = gr.State(value=None)
     hf_token_state = gr.State(value=INITIAL_HF_TOKEN)
 
+    with gr.Accordion(
+        "Управление Docker-сервисом",
+        open=False,
+        visible=DOCKER_SHUTDOWN_ENABLED,
+    ):
+        gr.Markdown(
+            "Кнопка останавливает контейнеры текущего Docker Compose stack. "
+            "Используйте ее, когда нужно полностью завершить сервис."
+        )
+        docker_shutdown_btn = gr.Button("Завершить Docker", variant="stop")
+        docker_shutdown_status = gr.Markdown("")
+
     with gr.Accordion("Доступ Hugging Face", open=not bool(INITIAL_HF_TOKEN)):
         hf_token_input = gr.Textbox(
             label="Hugging Face token",
@@ -1239,6 +1370,11 @@ with gr.Blocks(title="Транскрибация, диаризация и сум
         fn=clear_hf_token,
         inputs=[],
         outputs=[hf_token_state, hf_token_input, hf_token_status],
+    )
+    docker_shutdown_btn.click(
+        fn=shutdown_docker_stack,
+        inputs=[],
+        outputs=[docker_shutdown_status],
     )
 
     save_model_settings_btn.click(
