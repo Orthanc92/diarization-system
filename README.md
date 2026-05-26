@@ -154,7 +154,7 @@ model_cache/huggingface
 Docker defaults to `Qwen/Qwen3-14B-AWQ` through vLLM and keeps Whisper on CPU so
 the LLM can use GPU memory. To change ports, model, Hugging Face token, or move
 Whisper to GPU, edit `docker.env`. If port `3002` is already occupied, change
-`APP_PORT`. For RTX 4090 the Docker default `VLLM_MAX_MODEL_LEN=16384` allows
+`APP_PORT`. For RTX 4090 the Docker default `VLLM_MAX_MODEL_LEN=32768` allows
 larger text chunks while keeping a practical KV-cache reserve. `Qwen/Qwen3-32B-AWQ` is heavier and can fail on 24 GB GPUs because
 there is not enough memory left for vLLM KV-cache.
 

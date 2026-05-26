@@ -18,7 +18,7 @@ services:
       - --gpu-memory-utilization
       - ${VLLM_GPU_MEMORY_UTILIZATION:-0.90}
       - --max-model-len
-      - ${VLLM_MAX_MODEL_LEN:-16384}
+      - ${VLLM_MAX_MODEL_LEN:-32768}
     ports:
       - "${VLLM_PORT:-8000}:8000"
     environment:
@@ -73,7 +73,7 @@ services:
       LLM_BACKEND: vllm
       VLLM_BASE_URL: http://vllm:8000/v1
       VLLM_MODEL_NAME: ${VLLM_MODEL_NAME:-Qwen/Qwen3-14B-AWQ}
-      VLLM_CONTEXT_WINDOW: ${VLLM_MAX_MODEL_LEN:-16384}
+      VLLM_CONTEXT_WINDOW: ${VLLM_MAX_MODEL_LEN:-32768}
       VLLM_CHUNK_CONTEXT_RESERVE_TOKENS: ${VLLM_CHUNK_CONTEXT_RESERVE_TOKENS:-1024}
       VLLM_CONTEXT_RETRY_RESERVE_TOKENS: ${VLLM_CONTEXT_RETRY_RESERVE_TOKENS:-16}
       VLLM_API_KEY: ${VLLM_API_KEY:-}
